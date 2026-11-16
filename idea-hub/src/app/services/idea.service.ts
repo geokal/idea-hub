@@ -16,9 +16,19 @@ const STORAGE_IDEAS_KEY = 'ideahub_feedback_data_v3';
 const STORAGE_NOTIFS_KEY = 'ideahub_notifs_data_v3';
 const STORAGE_ROLE_KEY = 'ideahub_role_data_v3';
 const STORAGE_PREFS_KEY = 'ideahub_prefs_data_v3';
+const STORAGE_PENDING_KEY = 'ideahub_pending_submissions_v1';
 
 export const CURRENT_CUSTOMER_EMAIL = 'customer@example.com';
 export const CURRENT_CUSTOMER_NAME = 'Sarah Customer';
+
+interface PendingSubmission {
+  tempId: string;
+  title: string;
+  description: string;
+  category: IdeaCategory;
+  authorName: string;
+  authorEmail: string;
+}
 
 interface IdeaBackendDTO {
   id: string;
@@ -38,6 +48,7 @@ interface IdeaBackendDTO {
 }
 
 interface IdeaDetailBackendDTO extends IdeaBackendDTO {
+  subscribers?: string[];
   comments: Array<{
     id: string;
     ideaId: string;
@@ -73,8 +84,9 @@ interface IdeaDetailBackendDTO extends IdeaBackendDTO {
 export class IdeaService {
   private readonly http = inject(HttpClient);
   private readonly API_BASE = 'http://localhost:8080/api';
-  private readonly _pendingSubmissionIds = new Set<string>();
+  private readonly _pendingSubmissions = new Map<string, PendingSubmission>();
   private readonly _ideaDetailSeq = new Map<string, number>();
+  private _listRevision = 0;
 
   // 1. Perspective / Role
   readonly currentRole = signal<UserRole>(this._loadRole());
@@ -121,8 +133,10 @@ export class IdeaService {
   readonly mergedCount = computed(() => this._ideas().filter(i => i.status === 'merged').length);
 
   constructor() {
+    this._loadPendingSubmissions();
     // Initial fetch from Go API backend
     this.refreshIdeas();
+    this._replayPendingSubmissions();
 
     // Auto-fetch full detail when an idea is opened
     effect(() => {
@@ -142,11 +156,29 @@ export class IdeaService {
 
   // Refresh ideas list from Go backend
   refreshIdeas(): void {
+    const reqRevision = ++this._listRevision;
     this.http.get<IdeaBackendDTO[]>(`${this.API_BASE}/ideas`, { headers: this._getHeaders() })
       .subscribe({
         next: (dtos) => {
           if (!dtos) return;
+          // Reject stale snapshot if a local mutation happened while this request was in flight
+          if (reqRevision !== this._listRevision) return;
+
           const existingMap = new Map(this._ideas().map(i => [i.id, i]));
+
+          // Reconcile pending submissions with canonical backend IDs
+          for (const dto of dtos) {
+            for (const [tempId, pending] of this._pendingSubmissions.entries()) {
+              if (dto.title === pending.title && dto.authorName === pending.authorName) {
+                this._pendingSubmissions.delete(tempId);
+                this._savePendingSubmissions();
+                if (this.selectedIdeaId() === tempId) {
+                  this.selectedIdeaId.set(dto.id);
+                }
+              }
+            }
+          }
+
           const backendList: ProductIdea[] = dtos.map(dto => {
             const prev = existingMap.get(dto.id);
             return {
@@ -171,7 +203,7 @@ export class IdeaService {
           });
 
           // Preserve any locally accepted submissions that have not yet synced
-          const pendingIdeas = this._ideas().filter(i => this._pendingSubmissionIds.has(i.id));
+          const pendingIdeas = this._ideas().filter(i => this._pendingSubmissions.has(i.id));
           this._ideas.set([...pendingIdeas, ...backendList]);
           this._saveIdeas();
         },
@@ -208,6 +240,9 @@ export class IdeaService {
                 commentsCount: detail.comments?.length ?? detail.commentsCount,
                 mergedIntoId: detail.mergedIntoId,
                 mergedIntoTitle: detail.mergedIntoTitle,
+                subscribedUserEmails: (detail.subscribers && detail.subscribers.length > 0)
+                  ? Array.from(new Set([...detail.subscribers, ...(idea.subscribedUserEmails || [])]))
+                  : idea.subscribedUserEmails,
                 comments: (detail.comments || []).map(c => ({
                   id: c.id,
                   authorName: c.authorName,
@@ -356,7 +391,17 @@ export class IdeaService {
     };
 
     // Track pending submission durably
-    this._pendingSubmissionIds.add(tempId);
+    const pendingPayload: PendingSubmission = {
+      tempId,
+      title: newIdea.title,
+      description: newIdea.description,
+      category: newIdea.category,
+      authorName: newIdea.authorName,
+      authorEmail: newIdea.authorEmail
+    };
+    this._pendingSubmissions.set(tempId, pendingPayload);
+    this._savePendingSubmissions();
+    this._listRevision++;
 
     // Optimistic UI update
     this._ideas.update(list => [newIdea, ...list]);
@@ -375,7 +420,8 @@ export class IdeaService {
       { headers: this._getHeaders() }
     ).subscribe({
       next: (res) => {
-        this._pendingSubmissionIds.delete(tempId);
+        this._pendingSubmissions.delete(tempId);
+        this._savePendingSubmissions();
         if (res && res.id) {
           // Remap selection if user opened the item while creation was in flight
           if (this.selectedIdeaId() === tempId) {
@@ -388,7 +434,7 @@ export class IdeaService {
         }
       },
       error: (err) => {
-        console.warn('Submit idea API sync error, queued locally:', err);
+        console.warn('Submit idea API sync error, preserved in pending storage for replay:', err);
       }
     });
 
@@ -397,6 +443,10 @@ export class IdeaService {
 
   // Toggle Upvote
   toggleUpvote(ideaId: string): void {
+    // Invalidate in-flight detail requests and advance revision
+    this._ideaDetailSeq.set(ideaId, (this._ideaDetailSeq.get(ideaId) || 0) + 1);
+    this._listRevision++;
+
     let nextUpvotes = 0;
     this._ideas.update(list =>
       list.map(idea => {
@@ -439,6 +489,7 @@ export class IdeaService {
 
   // Toggle Subscription
   toggleSubscription(ideaId: string): void {
+    this._listRevision++;
     this._ideas.update(list =>
       list.map(idea => {
         if (idea.id !== ideaId) return idea;
@@ -454,6 +505,15 @@ export class IdeaService {
       })
     );
     this._saveIdeas();
+
+    // Persist subscription on the server so status updates notify across browsers
+    this.http.post<{ subscribed: boolean }>(
+      `${this.API_BASE}/ideas/${ideaId}/subscribe`,
+      { email: CURRENT_CUSTOMER_EMAIL },
+      { headers: this._getHeaders() }
+    ).subscribe({
+      error: (err) => console.warn('Subscription server sync error:', err)
+    });
   }
 
   isSubscribed(idea: ProductIdea): boolean {
@@ -580,8 +640,14 @@ export class IdeaService {
   updateStatus(ideaId: string, newStatus: IdeaStatus, publicNote: string): void {
     if (!this.isTeamMember()) return;
 
-    // Invalidate earlier in-flight details
+    const previousIdea = this._ideas().find(i => i.id === ideaId);
+    if (!previousIdea) return;
+    const prevStatus = previousIdea.status;
+    const prevHistory = [...previousIdea.statusHistory];
+
+    // Invalidate in-flight details & advance revision
     this._ideaDetailSeq.set(ideaId, (this._ideaDetailSeq.get(ideaId) || 0) + 1);
+    this._listRevision++;
 
     const changedBy = this.isAdmin() ? 'David Park (Admin)' : 'Sarah Johnson (Team)';
     const noteText = publicNote.trim() || `Status updated to ${this.formatStatusLabel(newStatus)}.`;
@@ -594,7 +660,7 @@ export class IdeaService {
 
         const historyItem = {
           id: crypto.randomUUID(),
-          previousStatus: idea.status,
+          previousStatus: prevStatus,
           newStatus,
           changedBy,
           note: noteText,
@@ -612,10 +678,6 @@ export class IdeaService {
     );
     this._saveIdeas();
 
-    if (targetIdea) {
-      this._dispatchAsyncNotifications(targetIdea, newStatus, publicNote.trim());
-    }
-
     // Sync to Go Fiber API
     this.http.post<{ id: string; newStatus: string }>(
       `${this.API_BASE}/ideas/${ideaId}/status`,
@@ -627,9 +689,21 @@ export class IdeaService {
       { headers: this._getHeaders() }
     ).subscribe({
       next: () => {
+        // Dispatch notifications only after server accepts the status update
+        if (targetIdea) {
+          this._dispatchAsyncNotifications(targetIdea, newStatus, publicNote.trim());
+        }
         this.fetchIdeaDetail(ideaId);
       },
-      error: (err) => console.warn('Status update API sync error:', err)
+      error: (err) => {
+        console.warn('Status update API sync error, reverting local status:', err);
+        // Recover local state from rejected status update
+        this._ideas.update(list =>
+          list.map(idea => idea.id === ideaId ? { ...idea, status: prevStatus, statusHistory: prevHistory } : idea)
+        );
+        this._saveIdeas();
+        this.fetchIdeaDetail(ideaId);
+      }
     });
   }
 
@@ -637,6 +711,11 @@ export class IdeaService {
   mergeIdeas(sourceIdeaId: string, targetIdeaId: string, mergeNote?: string): void {
     if (!this.isTeamMember()) return;
     if (sourceIdeaId === targetIdeaId) return;
+
+    // Invalidate in-flight detail requests for both source and target ideas
+    this._ideaDetailSeq.set(sourceIdeaId, (this._ideaDetailSeq.get(sourceIdeaId) || 0) + 1);
+    this._ideaDetailSeq.set(targetIdeaId, (this._ideaDetailSeq.get(targetIdeaId) || 0) + 1);
+    this._listRevision++;
 
     const source = this._ideas().find(i => i.id === sourceIdeaId);
     const target = this._ideas().find(i => i.id === targetIdeaId);
@@ -846,6 +925,57 @@ export class IdeaService {
     try {
       localStorage.setItem(STORAGE_IDEAS_KEY, JSON.stringify(this._ideas()));
     } catch {}
+  }
+
+  private _savePendingSubmissions(): void {
+    try {
+      const arr = Array.from(this._pendingSubmissions.values());
+      localStorage.setItem(STORAGE_PENDING_KEY, JSON.stringify(arr));
+    } catch {}
+  }
+
+  private _loadPendingSubmissions(): void {
+    try {
+      const raw = localStorage.getItem(STORAGE_PENDING_KEY);
+      if (raw) {
+        const arr: PendingSubmission[] = JSON.parse(raw);
+        for (const item of arr) {
+          this._pendingSubmissions.set(item.tempId, item);
+        }
+      }
+    } catch {}
+  }
+
+  private _replayPendingSubmissions(): void {
+    if (this._pendingSubmissions.size === 0) return;
+    for (const [tempId, item] of this._pendingSubmissions.entries()) {
+      this.http.post<{ id: string; message: string }>(
+        `${this.API_BASE}/ideas`,
+        {
+          title: item.title,
+          description: item.description,
+          category: item.category,
+          authorName: item.authorName,
+          authorEmail: item.authorEmail
+        },
+        { headers: this._getHeaders() }
+      ).subscribe({
+        next: (res) => {
+          this._pendingSubmissions.delete(tempId);
+          this._savePendingSubmissions();
+          if (res && res.id) {
+            if (this.selectedIdeaId() === tempId) {
+              this.selectedIdeaId.set(res.id);
+            }
+            this._ideas.update(list =>
+              list.map(i => i.id === tempId ? { ...i, id: res.id } : i)
+            );
+            this._saveIdeas();
+          }
+        },
+        error: (err) => console.warn('Pending replay error for', tempId, err)
+      });
+    }
   }
 
   private _saveNotifications(): void {

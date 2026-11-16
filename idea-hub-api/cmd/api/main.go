@@ -28,7 +28,7 @@ func main() {
 	app.Use(recover.New())
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "http://localhost:4300, http://localhost:4200, http://127.0.0.1:4300",
-		AllowHeaders: "Origin, Content-Type, Accept, X-User-Role, Authorization",
+		AllowHeaders: "Origin, Content-Type, Accept, X-User-Role, Authorization, X-Admin-Key",
 		AllowMethods: "GET, POST, PUT, DELETE, OPTIONS",
 	}))
 
@@ -49,6 +49,7 @@ func main() {
 	api.Get("/ideas/:id", h.GetIdeaByID)
 	api.Post("/ideas", h.CreateIdea)
 	api.Post("/ideas/:id/upvote", h.UpvoteIdea)
+	api.Post("/ideas/:id/subscribe", h.ToggleSubscription)
 	api.Post("/ideas/:id/status", h.UpdateStatus)
 	api.Post("/ideas/:id/comments", h.CreateComment)
 	api.Post("/ideas/merge", h.MergeIdeas)

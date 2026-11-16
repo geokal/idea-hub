@@ -19,9 +19,13 @@ func New() *Service {
 		dbPath = envPath
 	}
 
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		log.Fatalf("Fatal: failed to open SQLite database: %v", err)
+	}
+
+	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
+		log.Printf("Warning: failed to enforce SQLite foreign keys: %v", err)
 	}
 
 	db.SetMaxOpenConns(1) // SQLite works best with 1 writer
@@ -70,6 +74,15 @@ func (s *Service) initSchema() {
 		public_note TEXT,
 		created_at TEXT NOT NULL,
 		FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE
+	);
+
+	CREATE TABLE IF NOT EXISTS subscriptions (
+		id TEXT PRIMARY KEY,
+		idea_id TEXT NOT NULL,
+		user_email TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE,
+		UNIQUE (idea_id, user_email)
 	);
 	`
 	if _, err := s.DB.Exec(schema); err != nil {
