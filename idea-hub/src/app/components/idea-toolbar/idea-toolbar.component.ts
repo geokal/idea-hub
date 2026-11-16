@@ -7,94 +7,81 @@ import { IdeaStatus } from '../../models/idea.model';
   selector: 'app-idea-toolbar',
   imports: [FormsModule],
   template: `
-    <div class="space-y-3 pt-3">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-6 pb-2">
       
-      <!-- Top Row: Section Title & Status Filters -->
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+      <!-- Left: Search Box (as in Mockup Image 1) -->
+      <div class="relative flex-1 max-w-md">
+        <input
+          type="text"
+          placeholder="Search ideas..."
+          [ngModel]="ideaService.searchQuery()"
+          (ngModelChange)="ideaService.searchQuery.set($event)"
+          class="w-full bg-white dark:bg-stone-900 border border-stone-200/90 dark:border-stone-800 rounded-xl px-4 py-2.5 pl-10 text-xs sm:text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] dark:focus:border-emerald-500 shadow-2xs transition-all"
+        />
+        <svg class="w-4 h-4 text-stone-400 absolute left-3.5 top-3.5 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+        </svg>
+      </div>
+
+      <!-- Right: Dropdown Filters (All statuses ↕ and Most votes ↕) -->
+      <div class="flex items-center gap-2.5 flex-wrap sm:flex-nowrap">
         
-        <!-- Status Tabs -->
-        <div class="flex items-center gap-1 overflow-x-auto pb-1 sm:pb-0 scrollbar-none text-xs">
-          @for (tab of statusTabs; track tab.value) {
-            <button
-              type="button"
-              (click)="ideaService.statusFilter.set(tab.value)"
-              class="px-2.5 py-1 rounded-lg font-medium whitespace-nowrap transition-all flex items-center gap-1.5"
-              [class.bg-stone-900]="ideaService.statusFilter() === tab.value"
-              [class.text-white]="ideaService.statusFilter() === tab.value"
-              [class.dark:bg-stone-100]="ideaService.statusFilter() === tab.value"
-              [class.dark:text-stone-900]="ideaService.statusFilter() === tab.value"
-              [class.text-stone-500]="ideaService.statusFilter() !== tab.value"
-              [class.dark:text-stone-400]="ideaService.statusFilter() !== tab.value"
-              [class.hover:text-stone-800]="ideaService.statusFilter() !== tab.value"
-            >
-              <span>{{ tab.label }}</span>
-              <span class="text-[10px] opacity-75">({{ getCount(tab.value) }})</span>
-            </button>
-          }
+        <!-- Status Filter Dropdown -->
+        <div class="relative">
+          <select
+            [ngModel]="ideaService.statusFilter()"
+            (ngModelChange)="ideaService.statusFilter.set($event)"
+            class="appearance-none bg-white dark:bg-stone-900 border border-stone-200/90 dark:border-stone-800 rounded-xl px-3.5 py-2.5 pr-8 text-xs sm:text-sm text-stone-700 dark:text-stone-300 hover:border-stone-300 dark:hover:border-stone-700 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] shadow-2xs cursor-pointer transition-all"
+          >
+            <option value="all">All statuses</option>
+            <option value="under-review">Under Review ({{ ideaService.underReviewCount() }})</option>
+            <option value="planned">Planned ({{ ideaService.plannedCount() }})</option>
+            <option value="in-progress">In Progress ({{ ideaService.inProgressCount() }})</option>
+            <option value="completed">Completed ({{ ideaService.completedCount() }})</option>
+            <option value="declined">Declined ({{ ideaService.declinedCount() }})</option>
+          </select>
+          <div class="pointer-events-none absolute right-2.5 top-3.5 text-stone-400">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
+            </svg>
+          </div>
         </div>
 
-        <!-- Sort Select & Board Cleanliness Toggle -->
-        <div class="flex items-center gap-2 self-end sm:self-auto">
-          @if (ideaService.isTeamMember() && ideaService.statusFilter() === 'all') {
-            <button
-              type="button"
-              (click)="ideaService.showMerged.update(v => !v)"
-              class="text-[11px] px-2 py-0.5 rounded-md border text-stone-500 dark:text-stone-400 hover:text-stone-800 transition-colors"
-              [class.bg-purple-50]="ideaService.showMerged()"
-              [class.border-purple-300]="ideaService.showMerged()"
-              [class.text-purple-700]="ideaService.showMerged()"
-              [class.dark:bg-purple-950/40]="ideaService.showMerged()"
-              [class.dark:border-purple-800]="ideaService.showMerged()"
-              [class.dark:text-purple-400]="ideaService.showMerged()"
-              title="Toggle display of merged duplicates to keep board clean"
-            >
-              {{ ideaService.showMerged() ? 'Hide Merged' : 'Show Merged' }} ({{ ideaService.mergedCount() }})
-            </button>
-          }
-
+        <!-- Sort Option Dropdown -->
+        <div class="relative">
           <select
             [ngModel]="ideaService.sortOption()"
             (ngModelChange)="ideaService.sortOption.set($event)"
-            class="bg-transparent text-xs text-stone-500 dark:text-stone-400 hover:text-stone-800 dark:hover:text-stone-200 focus:outline-none cursor-pointer"
+            class="appearance-none bg-white dark:bg-stone-900 border border-stone-200/90 dark:border-stone-800 rounded-xl px-3.5 py-2.5 pr-8 text-xs sm:text-sm text-stone-700 dark:text-stone-300 hover:border-stone-300 dark:hover:border-stone-700 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] shadow-2xs cursor-pointer transition-all"
           >
-            <option value="upvotes-desc" class="bg-white dark:bg-stone-900 text-stone-800 dark:text-stone-200">↑ Most Upvoted</option>
-            <option value="date-desc" class="bg-white dark:bg-stone-900 text-stone-800 dark:text-stone-200">↕ Newest First</option>
-            <option value="comments-desc" class="bg-white dark:bg-stone-900 text-stone-800 dark:text-stone-200">💬 Most Discussed</option>
+            <option value="upvotes-desc">Most votes</option>
+            <option value="date-desc">Newest first</option>
+            <option value="comments-desc">Most discussed</option>
           </select>
+          <div class="pointer-events-none absolute right-2.5 top-3.5 text-stone-400">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
+            </svg>
+          </div>
         </div>
 
-      </div>
-
-      <!-- Second Row: Search & Category Filter -->
-      <div class="flex items-center gap-2">
-        
-        <!-- Search Input -->
-        <div class="relative flex-1">
-          <input
-            type="text"
-            placeholder="Search ideas, keywords, authors..."
-            [ngModel]="ideaService.searchQuery()"
-            (ngModelChange)="ideaService.searchQuery.set($event)"
-            class="w-full bg-white dark:bg-stone-900 border border-stone-200/80 dark:border-stone-800 rounded-xl px-3 py-1.5 pl-8 text-xs text-stone-800 dark:text-stone-100 placeholder-stone-400 focus:outline-none focus:border-stone-400"
-          />
-          <svg class="w-3.5 h-3.5 text-stone-400 absolute left-2.5 top-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-          </svg>
-        </div>
-
-        <!-- Category Dropdown Filter -->
-        <select
-          [ngModel]="ideaService.categoryFilter()"
-          (ngModelChange)="ideaService.categoryFilter.set($event)"
-          class="bg-white dark:bg-stone-900 border border-stone-200/80 dark:border-stone-800 rounded-xl px-2.5 py-1.5 text-xs text-stone-600 dark:text-stone-300 focus:outline-none cursor-pointer"
-        >
-          <option value="all">All Categories</option>
-          <option value="Core Feature">Core Feature</option>
-          <option value="UI / UX">UI / UX</option>
-          <option value="Performance">Performance</option>
-          <option value="Integrations">Integrations</option>
-          <option value="Mobile">Mobile</option>
-        </select>
+        <!-- Team Member Extra: Show Merged Duplicates Toggle -->
+        @if (ideaService.isTeamMember()) {
+          <button
+            type="button"
+            (click)="ideaService.showMerged.update(v => !v)"
+            class="text-xs px-3 py-2 rounded-xl border border-stone-200 dark:border-stone-800 transition-colors"
+            [class.bg-purple-50]="ideaService.showMerged()"
+            [class.border-purple-300]="ideaService.showMerged()"
+            [class.text-purple-700]="ideaService.showMerged()"
+            [class.dark:bg-purple-950/40]="ideaService.showMerged()"
+            [class.dark:text-purple-300]="ideaService.showMerged()"
+            [class.text-stone-500]="!ideaService.showMerged()"
+            title="Toggle visibility of merged duplicate ideas"
+          >
+            {{ ideaService.showMerged() ? 'Hide Merged' : 'Show Merged' }} ({{ ideaService.mergedCount() }})
+          </button>
+        }
 
       </div>
 
@@ -103,24 +90,4 @@ import { IdeaStatus } from '../../models/idea.model';
 })
 export class IdeaToolbarComponent {
   readonly ideaService = inject(IdeaService);
-
-  readonly statusTabs: { value: IdeaStatus | 'all'; label: string }[] = [
-    { value: 'all', label: 'All Active' },
-    { value: 'under-review', label: 'Under Review' },
-    { value: 'planned', label: 'Planned' },
-    { value: 'in-progress', label: 'In Progress' },
-    { value: 'completed', label: 'Completed' },
-    { value: 'declined', label: 'Declined' },
-    { value: 'merged', label: 'Merged' },
-  ];
-
-  getCount(status: IdeaStatus | 'all'): number {
-    if (status === 'all') return this.ideaService.totalCount();
-    if (status === 'under-review') return this.ideaService.underReviewCount();
-    if (status === 'planned') return this.ideaService.plannedCount();
-    if (status === 'in-progress') return this.ideaService.inProgressCount();
-    if (status === 'completed') return this.ideaService.completedCount();
-    if (status === 'merged') return this.ideaService.mergedCount();
-    return this.ideaService.ideas().filter(i => i.status === 'declined').length;
-  }
 }

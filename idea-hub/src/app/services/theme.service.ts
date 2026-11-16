@@ -5,10 +5,15 @@ export class ThemeService {
   readonly isDark = signal<boolean>(false);
 
   constructor() {
+    let initialDark = false;
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('ideahub_theme');
-      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-      const initialDark = saved ? saved === 'dark' : prefersDark;
+      try {
+        const saved = localStorage.getItem('ideahub_theme');
+        const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        initialDark = saved ? saved === 'dark' : prefersDark;
+      } catch {
+        initialDark = false;
+      }
       this.isDark.set(initialDark);
       this._apply(initialDark);
     }
@@ -18,7 +23,11 @@ export class ThemeService {
     const next = !this.isDark();
     this.isDark.set(next);
     if (typeof window !== 'undefined') {
-      localStorage.setItem('ideahub_theme', next ? 'dark' : 'light');
+      try {
+        localStorage.setItem('ideahub_theme', next ? 'dark' : 'light');
+      } catch {
+        // Continue even if storage quota or cookies are disabled
+      }
       this._apply(next);
     }
   }

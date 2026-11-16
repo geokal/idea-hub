@@ -7,173 +7,189 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
   selector: 'app-idea-submit',
   imports: [FormsModule],
   template: `
-    <div class="bg-white dark:bg-stone-900 rounded-2xl p-3.5 sm:p-4 shadow-[0_2px_10px_rgba(0,0,0,0.02)] border border-stone-200/90 dark:border-stone-800 transition-all focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100 dark:focus-within:border-blue-500 dark:focus-within:ring-blue-950">
-      
-      <!-- Top Title Input Bar -->
-      <div class="flex items-center gap-2.5">
-        
-        <!-- Plus Circle Icon -->
-        <div class="pl-1 text-stone-400 dark:text-stone-500 flex-shrink-0">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="9" stroke-width="1.8" />
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M12 8v8m-4-4h8" />
-          </svg>
-        </div>
-
-        <!-- Input Field (Max 120 chars) -->
-        <input
-          type="text"
-          placeholder="Submit feedback or request a feature..."
-          maxlength="120"
-          [ngModel]="title()"
-          (ngModelChange)="onTitleChange($event)"
-          (focus)="isExpanded.set(true)"
-          (keydown.enter)="!isExpanded() ? isExpanded.set(true) : null"
-          class="flex-1 bg-transparent text-sm text-stone-800 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none"
-        />
-
-        <!-- Expand / Collapse Toggle -->
-        <button
-          type="button"
-          (click)="isExpanded.update(v => !v)"
-          class="p-1.5 text-stone-400 hover:text-stone-600 dark:hover:text-stone-300 rounded-lg transition-colors text-xs"
-          [title]="isExpanded() ? 'Collapse form' : 'Add details'"
+    <!-- Share your idea Modal Dialog (Directly matching Instructor Mockup Image 2) -->
+    @if (ideaService.isSubmitModalOpen()) {
+      <div
+        class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/50 backdrop-blur-xs transition-opacity animate-fade-in"
+        (click)="close()"
+        (keydown.escape)="close()"
+      >
+        <div
+          class="relative w-full max-w-lg bg-[#FAF9F5] dark:bg-[#1A1A18] rounded-2xl p-6 sm:p-7 shadow-2xl border border-stone-200/90 dark:border-stone-800 transition-all text-stone-800 dark:text-stone-100 animate-scale-up"
+          (click)="$event.stopPropagation()"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" [attr.d]="isExpanded() ? 'M5 15l7-7 7 7' : 'M19 9l-7 7-7-7'" />
-          </svg>
-        </button>
-
-        <!-- Submit Button -->
-        <button
-          type="button"
-          (click)="submit()"
-          [disabled]="!canSubmit()"
-          class="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/60 disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-        >
-          Submit
-        </button>
-      </div>
-
-      <!-- Real-Time Duplicate Detection Prompt (Section 1 of SPEC.MD) -->
-      @if (potentialDuplicates().length > 0) {
-        <div class="mt-2.5 p-2.5 rounded-xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/40 text-xs">
-          <div class="flex items-center gap-1.5 text-amber-800 dark:text-amber-300 font-semibold mb-1">
-            <span>💡</span>
-            <span>Similar existing feedback found:</span>
-          </div>
-          <div class="space-y-1">
-            @for (dup of potentialDuplicates().slice(0, 2); track dup.id) {
-              <div class="flex items-center justify-between gap-2 text-stone-700 dark:text-stone-300">
-                <span class="truncate">"{{ dup.title }}" ({{ dup.upvotes }} votes)</span>
-                <button
-                  type="button"
-                  (click)="upvoteDuplicate(dup.id)"
-                  class="text-[11px] font-semibold text-blue-600 dark:text-blue-400 hover:underline flex-shrink-0"
-                >
-                  Upvote this instead →
-                </button>
-              </div>
-            }
-          </div>
-        </div>
-      }
-
-      <!-- Expandable Details Section -->
-      @if (isExpanded()) {
-        <div class="mt-3 pt-3 border-t border-stone-100 dark:border-stone-800 space-y-3">
           
-          <!-- Description (Required, Max 2000 chars) -->
-          <div>
-            <textarea
-              placeholder="Describe your feedback, feature request, or problem in detail..."
-              maxlength="2000"
-              [ngModel]="description()"
-              (ngModelChange)="description.set($event)"
-              rows="3"
-              class="w-full bg-stone-50/70 dark:bg-stone-850 border border-stone-200/60 dark:border-stone-800 rounded-xl px-3 py-2 text-xs text-stone-700 dark:text-stone-200 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:border-stone-300 dark:focus:border-stone-700 transition-all resize-none"
-            ></textarea>
-            <div class="flex justify-between text-[10px] text-stone-400 mt-0.5">
-              <span>Plain text description</span>
-              <span>{{ description().length }}/2000</span>
-            </div>
+          <!-- Modal Header -->
+          <div class="flex items-center justify-between pb-4">
+            <h2 class="text-2xl font-serif font-bold text-stone-900 dark:text-stone-100 tracking-tight">
+              Share your idea
+            </h2>
+            <button
+              type="button"
+              (click)="close()"
+              class="w-8 h-8 rounded-full flex items-center justify-center text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 hover:bg-stone-200/60 dark:hover:bg-stone-800 transition-colors"
+              title="Close"
+            >
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
 
-          <!-- Customer Identity Fields (Section 1: Name public, Email private) -->
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <!-- Real-Time Duplicate Detection Alert -->
+          @if (potentialDuplicates().length > 0) {
+            <div class="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/50 text-xs text-amber-900 dark:text-amber-200">
+              <div class="flex items-center gap-1.5 font-semibold mb-1">
+                <span>💡</span>
+                <span>Similar feedback already exists:</span>
+              </div>
+              <div class="space-y-1 mt-1">
+                @for (dup of potentialDuplicates().slice(0, 2); track dup.id) {
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="truncate">"{{ dup.title }}" ({{ dup.upvotes }} votes)</span>
+                    <button
+                      type="button"
+                      (click)="upvoteDuplicate(dup.id)"
+                      class="text-[11px] font-semibold text-[#1B4D3E] dark:text-emerald-400 hover:underline flex-shrink-0"
+                    >
+                      Upvote this instead →
+                    </button>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+
+          <!-- Form Fields -->
+          <form (submit)="submit($event)" class="space-y-4">
+            
+            <!-- TITLE -->
             <div>
-              <label class="block text-[10px] font-semibold uppercase tracking-wider text-stone-400 mb-1">
-                Name or Display Name <span class="text-stone-500 font-normal">(shown publicly)</span>
+              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
+                Title
               </label>
               <input
                 type="text"
-                placeholder="e.g. Sarah J."
-                [ngModel]="authorName()"
-                (ngModelChange)="authorName.set($event)"
-                class="w-full bg-stone-50/70 dark:bg-stone-850 border border-stone-200/60 dark:border-stone-800 rounded-xl px-3 py-1.5 text-xs text-stone-700 dark:text-stone-200 placeholder-stone-400 focus:outline-none"
+                placeholder="e.g. Dark mode support"
+                maxlength="120"
+                [ngModel]="title()"
+                (ngModelChange)="onTitleChange($event)"
+                name="title"
+                required
+                class="w-full bg-[#F3F2EC] dark:bg-stone-850 border border-stone-200 dark:border-stone-750 rounded-xl px-3.5 py-2.5 text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] dark:focus:border-emerald-500 transition-all"
               />
             </div>
-            
+
+            <!-- DESCRIPTION -->
             <div>
-              <label class="block text-[10px] font-semibold uppercase tracking-wider text-stone-400 mb-1">
-                Email Address <span class="text-amber-600 dark:text-amber-400 font-normal">(private, not shown publicly)</span>
+              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
+                Description
+              </label>
+              <textarea
+                placeholder="Describe your idea and the problem it solves..."
+                maxlength="2000"
+                [ngModel]="description()"
+                (ngModelChange)="description.set($event)"
+                name="description"
+                rows="4"
+                required
+                class="w-full bg-[#F3F2EC] dark:bg-stone-850 border border-stone-200 dark:border-stone-750 rounded-xl px-3.5 py-2.5 text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] dark:focus:border-emerald-500 transition-all resize-none"
+              ></textarea>
+            </div>
+
+            <!-- YOUR EMAIL -->
+            <div>
+              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
+                Your Email
               </label>
               <input
                 type="email"
-                placeholder="your.email@company.com"
+                placeholder="you@example.com"
                 [ngModel]="authorEmail()"
                 (ngModelChange)="authorEmail.set($event)"
-                class="w-full bg-stone-50/70 dark:bg-stone-850 border border-stone-200/60 dark:border-stone-800 rounded-xl px-3 py-1.5 text-xs text-stone-700 dark:text-stone-200 placeholder-stone-400 focus:outline-none"
+                name="authorEmail"
+                required
+                class="w-full bg-[#F3F2EC] dark:bg-stone-850 border border-stone-200 dark:border-stone-750 rounded-xl px-3.5 py-2.5 text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] dark:focus:border-emerald-500 transition-all"
+              />
+              <p class="text-[11px] text-stone-500 dark:text-stone-400 mt-1.5 leading-relaxed">
+                We'll send you a confirmation link and notify you of updates. Your email is never shown publicly.
+              </p>
+            </div>
+
+            <!-- YOUR NAME — optional -->
+            <div>
+              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
+                Your Name <span class="font-normal text-stone-400 dark:text-stone-500">— optional</span>
+              </label>
+              <input
+                type="text"
+                placeholder="Jane Smith"
+                [ngModel]="authorName()"
+                (ngModelChange)="authorName.set($event)"
+                name="authorName"
+                class="w-full bg-[#F3F2EC] dark:bg-stone-850 border border-stone-200 dark:border-stone-750 rounded-xl px-3.5 py-2.5 text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] dark:focus:border-emerald-500 transition-all"
               />
             </div>
-          </div>
 
-          <!-- Category Selector -->
-          <div>
-            <label class="block text-[10px] font-bold uppercase tracking-wider text-stone-400 dark:text-stone-500 mb-1.5">
-              Category
-            </label>
-            <div class="flex flex-wrap gap-1.5">
-              @for (cat of categories; track cat) {
-                <button
-                  type="button"
-                  (click)="selectedCategory.set(cat)"
-                  class="px-2.5 py-1 rounded-lg text-xs font-medium transition-all"
-                  [class.bg-stone-900]="selectedCategory() === cat"
-                  [class.text-white]="selectedCategory() === cat"
-                  [class.dark:bg-stone-100]="selectedCategory() === cat"
-                  [class.dark:text-stone-900]="selectedCategory() === cat"
-                  [class.bg-stone-100]="selectedCategory() !== cat"
-                  [class.dark:bg-stone-800]="selectedCategory() !== cat"
-                  [class.text-stone-600]="selectedCategory() !== cat"
-                  [class.dark:text-stone-400]="selectedCategory() !== cat"
-                >
-                  {{ cat }}
-                </button>
-              }
+            <!-- Category (optional subtle tag selector) -->
+            <div class="pt-1">
+              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
+                Category
+              </label>
+              <div class="flex flex-wrap gap-1.5">
+                @for (cat of categories; track cat) {
+                  <button
+                    type="button"
+                    (click)="selectedCategory.set(cat)"
+                    class="px-2.5 py-1 rounded-lg text-xs font-medium border transition-all"
+                    [class.bg-[#1B4D3E]]="selectedCategory() === cat"
+                    [class.text-white]="selectedCategory() === cat"
+                    [class.border-[#1B4D3E]]="selectedCategory() === cat"
+                    [class.bg-white]="selectedCategory() !== cat"
+                    [class.dark:bg-stone-800]="selectedCategory() !== cat"
+                    [class.text-stone-600]="selectedCategory() !== cat"
+                    [class.dark:text-stone-300]="selectedCategory() !== cat"
+                    [class.border-stone-200]="selectedCategory() !== cat"
+                    [class.dark:border-stone-750]="selectedCategory() !== cat"
+                  >
+                    {{ cat }}
+                  </button>
+                }
+              </div>
             </div>
-          </div>
 
-          <!-- Low Friction Notice -->
-          <div class="text-[11px] text-stone-400 flex items-center justify-between pt-1">
-            <span>✨ No password required — verified by email link</span>
-            <span class="text-[10px] text-stone-400">Max 120 chars</span>
-          </div>
+            <!-- Modal Action Buttons (Cancel / Submit idea in Forest Green) -->
+            <div class="flex items-center justify-end gap-2.5 pt-4 border-t border-stone-200/80 dark:border-stone-800">
+              <button
+                type="button"
+                (click)="close()"
+                class="px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-750 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                [disabled]="!canSubmit()"
+                class="px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-[#1B4D3E] hover:bg-[#143d31] text-white disabled:opacity-40 disabled:cursor-not-allowed shadow-sm transition-all"
+              >
+                Submit idea
+              </button>
+            </div>
+
+          </form>
 
         </div>
-      }
-
-    </div>
+      </div>
+    }
   `,
 })
 export class IdeaSubmitComponent {
-  private readonly ideaService = inject(IdeaService);
+  readonly ideaService = inject(IdeaService);
 
-  readonly isExpanded = signal(false);
   readonly title = signal('');
   readonly description = signal('');
   readonly selectedCategory = signal<IdeaCategory>('Core Feature');
-  readonly authorName = signal('Sarah Customer');
+  readonly authorName = signal('Jane Smith');
   readonly authorEmail = signal('sarah.c@external.com');
   readonly potentialDuplicates = signal<ProductIdea[]>([]);
 
@@ -185,39 +201,46 @@ export class IdeaSubmitComponent {
     'Mobile',
   ];
 
+  readonly canSubmit = computed(() => {
+    return this.title().trim().length >= 3 &&
+           this.description().trim().length >= 5 &&
+           this.authorEmail().trim().includes('@');
+  });
+
+  close(): void {
+    this.ideaService.isSubmitModalOpen.set(false);
+  }
+
   onTitleChange(newTitle: string): void {
     this.title.set(newTitle);
-    this.potentialDuplicates.set(this.ideaService.findDuplicates(newTitle));
+    if (newTitle.trim().length >= 3) {
+      const dups = this.ideaService.detectDuplicates(newTitle);
+      this.potentialDuplicates.set(dups);
+    } else {
+      this.potentialDuplicates.set([]);
+    }
   }
 
-  canSubmit(): boolean {
-    return this.title().trim().length > 0 && this.description().trim().length > 0;
+  upvoteDuplicate(dupId: string): void {
+    this.ideaService.toggleUpvote(dupId);
+    this.close();
   }
 
-  upvoteDuplicate(ideaId: string): void {
-    this.ideaService.toggleUpvote(ideaId);
-    this.title.set('');
-    this.description.set('');
-    this.potentialDuplicates.set([]);
-    this.isExpanded.set(false);
-    this.ideaService.selectedIdeaId.set(ideaId);
-  }
-
-  submit(): void {
-    const t = this.title().trim();
-    if (!t) return;
+  submit(event?: Event): void {
+    if (event) event.preventDefault();
+    if (!this.canSubmit()) return;
 
     this.ideaService.submitIdea({
-      title: t,
-      description: this.description().trim() || 'No additional details provided.',
+      title: this.title().trim(),
+      description: this.description().trim(),
       category: this.selectedCategory(),
-      authorName: this.authorName(),
-      authorEmail: this.authorEmail(),
+      authorName: this.authorName().trim() || 'Anonymous Customer',
+      authorEmail: this.authorEmail().trim(),
     });
 
     this.title.set('');
     this.description.set('');
     this.potentialDuplicates.set([]);
-    this.isExpanded.set(false);
+    this.close();
   }
 }

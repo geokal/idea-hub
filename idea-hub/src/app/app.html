@@ -1,47 +1,64 @@
 <div [class.dark]="themeService.isDark()" class="min-h-screen">
-  <div class="bg-[#F8F7F4] dark:bg-[#161614] text-stone-850 dark:text-stone-100 min-h-screen transition-colors duration-200">
-    <div class="max-w-2xl mx-auto px-4 py-8 sm:py-12 flex flex-col min-h-screen">
+  <div class="bg-[#F8F7F4] dark:bg-[#141412] text-stone-900 dark:text-stone-100 min-h-screen font-sans transition-colors duration-200">
+    
+    <!-- Top Navigation Bar -->
+    <app-header />
+
+    <!-- Main Content Container -->
+    <div class="max-w-4xl mx-auto px-4 py-8 sm:py-12 flex flex-col min-h-[calc(100vh-80px)]">
       
-      <!-- Top Header with Role Switcher, Notifications & Theme Toggle -->
-      <app-header />
+      <!-- Hero Section (Directly matching Instructor Mockup Image 1) -->
+      <section class="text-center py-6 sm:py-10 max-w-2xl mx-auto">
+        <h1 class="text-4xl sm:text-5xl font-serif font-bold tracking-tight text-stone-900 dark:text-stone-50 leading-tight">
+          Share your <span class="italic text-[#1B4D3E] dark:text-emerald-400 font-normal">ideas</span> with us
+        </h1>
+        <p class="text-sm sm:text-base text-stone-500 dark:text-stone-400 mt-3 leading-relaxed">
+          Got a feature request or a way we could do things better? We read every submission and keep you updated on what we're working on.
+        </p>
+        <div class="mt-5">
+          <button
+            type="button"
+            (click)="ideaService.isSubmitModalOpen.set(true)"
+            class="px-6 py-2.5 rounded-xl text-sm font-semibold bg-[#1B4D3E] hover:bg-[#143d31] text-white shadow-sm hover:shadow-md transition-all cursor-pointer"
+          >
+            Submit an idea
+          </button>
+        </div>
+      </section>
 
-      <!-- Submit Idea Pill / Expanded Card -->
-      <app-idea-submit />
-
-      <!-- Filter Tabs, Search & Sort Toolbar -->
+      <!-- Search & Filters Toolbar -->
       <app-idea-toolbar />
 
-      <!-- Ideas Feed / List -->
-      <main class="space-y-3 flex-1 mb-8">
+      <!-- Idea Cards Feed / List -->
+      <main class="space-y-3.5 flex-1 mt-4 mb-12">
         @for (idea of ideaService.filteredIdeas(); track idea.id) {
           <app-idea-card [idea]="idea" />
         } @empty {
-          <div class="bg-white/60 dark:bg-stone-900/40 rounded-2xl p-8 sm:p-12 text-center border border-dashed border-stone-200 dark:border-stone-800 transition-colors">
-            <div class="w-12 h-12 mx-auto mb-3 rounded-full bg-stone-100 dark:bg-stone-800 flex items-center justify-center text-stone-400">
-              <svg class="w-6 h-6 stroke-[1.5]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M12 18v-5.25m0 0a6.01 6.01 0 001.5-.189m-1.5.189a6.01 6.01 0 01-1.5-.189m3.75 7.478a12.06 12.06 0 01-4.5 0m3.75 2.383a14.406 14.406 0 01-3 0M14.25 18v-.192c0-.983.658-1.823 1.508-2.316a7.5 7.5 0 10-7.516 0c.85.493 1.508 1.333 1.508 2.316V18" />
-              </svg>
-            </div>
+          <div class="bg-white/80 dark:bg-stone-900/40 rounded-2xl p-10 text-center border border-dashed border-stone-200 dark:border-stone-800 transition-colors">
             <h3 class="text-sm font-semibold text-stone-700 dark:text-stone-300 mb-1">
               No ideas matching your criteria
             </h3>
             <p class="text-xs text-stone-400 dark:text-stone-500 max-w-sm mx-auto">
-              Try adjusting your search query, selecting "All" statuses, or be the first to submit a new feature request above.
+              Try adjusting your search query or selecting a different status filter.
             </p>
           </div>
         }
       </main>
 
+      <!-- Share Your Idea Modal (Mockup Image 2) -->
+      <app-idea-submit />
+
       <!-- Detail Modal Drawer -->
       <app-idea-detail />
 
       <!-- Subdued Footer -->
-      <footer class="mt-auto text-center py-4 border-t border-stone-200/40 dark:border-stone-850">
-        <p class="text-[11px] text-stone-400 dark:text-stone-500 tracking-wide">
-          IdeaHub · Product Idea & Feedback System · All data synced to localStorage
+      <footer class="mt-auto text-center py-6 border-t border-stone-200/50 dark:border-stone-850">
+        <p class="text-xs text-stone-400 dark:text-stone-500">
+          productideas · Product Idea & Feedback System · Connected to Go Fiber & SQLite API
         </p>
       </footer>
 
     </div>
+
   </div>
 </div>

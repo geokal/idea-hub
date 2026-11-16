@@ -29,8 +29,9 @@ export class IdeaService {
   private readonly _notifications = signal<CustomerNotification[]>(this._loadNotifications());
   readonly notificationPreferences = signal<NotificationPreferences>(this._loadPreferences());
 
-  // 3. Active Idea selected for detail modal
+  // 3. Active Idea selected for detail modal & Submit Modal
   readonly selectedIdeaId = signal<string | null>(null);
+  readonly isSubmitModalOpen = signal<boolean>(false);
 
   // 4. Filters & Search
   readonly statusFilter = signal<IdeaStatus | 'all'>('all');
@@ -61,7 +62,18 @@ export class IdeaService {
   readonly plannedCount = computed(() => this._ideas().filter(i => i.status === 'planned').length);
   readonly inProgressCount = computed(() => this._ideas().filter(i => i.status === 'in-progress').length);
   readonly completedCount = computed(() => this._ideas().filter(i => i.status === 'completed').length);
+  readonly declinedCount = computed(() => this._ideas().filter(i => i.status === 'declined').length);
   readonly mergedCount = computed(() => this._ideas().filter(i => i.status === 'merged').length);
+
+  detectDuplicates(query: string): ProductIdea[] {
+    const q = query.trim().toLowerCase();
+    if (!q || q.length < 3) return [];
+    const words = q.split(/\s+/).filter(w => w.length > 2);
+    return this._ideas().filter(i => {
+      const titleLower = i.title.toLowerCase();
+      return words.some(w => titleLower.includes(w));
+    });
+  }
 
   // Filtered Ideas Feed
   readonly filteredIdeas = computed(() => {
