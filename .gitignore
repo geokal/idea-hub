@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Angular & Build outputs
+dist/
+tmp/
+out-tsc/
+.angular/
+coverage/
+
+# Go binaries & build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/idea-hub-api/api.exe
+/idea-hub-api/main.exe
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE & Editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/mcp.json
+.idea/
+*.suo
+*.user
+
+# OS Files
+Thumbs.db
+.DS_Store
