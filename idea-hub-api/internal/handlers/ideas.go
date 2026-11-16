@@ -43,6 +43,38 @@ func (h *Handler) resolveCanonicalIdeaID(id string) string {
 	return curr
 }
 
+func (h *Handler) getMergeFamilyIDs(ideaID string) (canonicalID string, familyIDs []string) {
+	canonicalID = h.resolveCanonicalIdeaID(ideaID)
+	familyMap := map[string]bool{canonicalID: true, ideaID: true}
+
+	// Find all ideas that merge into canonicalID directly or indirectly
+	queue := []string{canonicalID}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		rows, err := h.db.DB.Query("SELECT id FROM ideas WHERE merged_into_id = ?", curr)
+		if err == nil {
+			for rows.Next() {
+				var childID string
+				if err := rows.Scan(&childID); err == nil && childID != "" {
+					if !familyMap[childID] {
+						familyMap[childID] = true
+						queue = append(queue, childID)
+					}
+				}
+			}
+			rows.Close()
+		}
+	}
+
+	familyIDs = make([]string, 0, len(familyMap))
+	for id := range familyMap {
+		familyIDs = append(familyIDs, id)
+	}
+	return canonicalID, familyIDs
+}
+
 type IdeaDTO struct {
 	ID              string   `json:"id"`
 	Title           string   `json:"title"`
@@ -323,8 +355,19 @@ func (h *Handler) GetIdeaByID(c *fiber.Ctx) error {
 	}
 
 	detail.Subscribers = []string{}
-	canonicalID := h.resolveCanonicalIdeaID(id)
-	subRows, err := h.db.DB.Query("SELECT user_email FROM subscriptions WHERE idea_id = ? OR idea_id = ?", canonicalID, id)
+	canonicalID, familyIDs := h.getMergeFamilyIDs(id)
+	subQuery := "SELECT user_email FROM subscriptions WHERE idea_id = ?"
+	args := []interface{}{canonicalID}
+	if len(familyIDs) > 1 {
+		placeholders := make([]string, len(familyIDs))
+		args = make([]interface{}, len(familyIDs))
+		for i, fid := range familyIDs {
+			placeholders[i] = "?"
+			args[i] = fid
+		}
+		subQuery = fmt.Sprintf("SELECT user_email FROM subscriptions WHERE idea_id IN (%s)", strings.Join(placeholders, ","))
+	}
+	subRows, err := h.db.DB.Query(subQuery, args...)
 	if err == nil {
 		seen := make(map[string]bool)
 		for subRows.Next() {
@@ -808,8 +851,8 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 	defer tx.Rollback()
 
 	var sourceUpvotes int
-	var sourceTitle, sourceStatus string
-	err = tx.QueryRow("SELECT upvotes, title, status FROM ideas WHERE id = ?", req.SourceIdeaID).Scan(&sourceUpvotes, &sourceTitle, &sourceStatus)
+	var sourceTitle, sourceStatus, sourceAuthorEmail string
+	err = tx.QueryRow("SELECT upvotes, title, status, author_email FROM ideas WHERE id = ?", req.SourceIdeaID).Scan(&sourceUpvotes, &sourceTitle, &sourceStatus, &sourceAuthorEmail)
 	if err == sql.ErrNoRows {
 		return c.Status(404).JSON(fiber.Map{"error": "Source idea not found"})
 	} else if err != nil {
@@ -846,9 +889,20 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to update source idea: " + err.Error()})
 	}
 
+	// Flatten previous merge children of source idea to point directly to target idea
+	if _, err := tx.Exec(`
+		UPDATE ideas SET merged_into_id = ?, merged_into_title = ?, updated_at = ?
+		WHERE merged_into_id = ?
+	`, req.TargetIdeaID, targetTitle, now, req.SourceIdeaID); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to flatten chained merge: " + err.Error()})
+	}
+
 	// 2. Consolidate votes avoiding double-counting:
-	// Find all voters from source idea
-	vRows, err := tx.Query("SELECT voter_key FROM votes WHERE idea_id = ?", req.SourceIdeaID)
+	// Find all voters from source idea and its merged children
+	vRows, err := tx.Query(`
+		SELECT DISTINCT voter_key FROM votes
+		WHERE idea_id = ? OR idea_id IN (SELECT id FROM ideas WHERE merged_into_id = ?)
+	`, req.SourceIdeaID, req.SourceIdeaID)
 	var sourceVoters []string
 	if err == nil {
 		for vRows.Next() {
@@ -866,30 +920,51 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 		_ = tx.QueryRow("SELECT COUNT(*) FROM votes WHERE idea_id = ? AND voter_key = ?", req.TargetIdeaID, vk).Scan(&exists)
 		if exists == 0 {
 			voteID := uuid.New().String()
-			_, _ = tx.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", voteID, req.TargetIdeaID, vk, now)
-			newTransferredVotes++
+			if _, err := tx.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", voteID, req.TargetIdeaID, vk, now); err == nil {
+				newTransferredVotes++
+			}
 		}
 	}
 
-	// Consolidate subscriptions
-	sRows, err := tx.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", req.SourceIdeaID)
+	// Remove votes from aliases so no duplicate vote records persist
+	_, _ = tx.Exec(`
+		DELETE FROM votes
+		WHERE idea_id = ? OR idea_id IN (SELECT id FROM ideas WHERE merged_into_id = ?)
+	`, req.SourceIdeaID, req.SourceIdeaID)
+
+	// Consolidate subscriptions from source and all of its merged children
+	sRows, err := tx.Query(`
+		SELECT DISTINCT LOWER(user_email) FROM subscriptions
+		WHERE idea_id = ? OR idea_id IN (SELECT id FROM ideas WHERE merged_into_id = ?)
+	`, req.SourceIdeaID, req.SourceIdeaID)
 	var sourceSubs []string
 	if err == nil {
 		for sRows.Next() {
 			var se string
 			if err := sRows.Scan(&se); err == nil && se != "" {
-				sourceSubs = append(sourceSubs, se)
+				sourceSubs = append(sourceSubs, strings.ToLower(strings.TrimSpace(se)))
 			}
 		}
 		sRows.Close()
 	}
+
 	for _, se := range sourceSubs {
 		var subExists int
-		_ = tx.QueryRow("SELECT COUNT(*) FROM subscriptions WHERE idea_id = ? AND user_email = ?", req.TargetIdeaID, se).Scan(&subExists)
+		_ = tx.QueryRow("SELECT COUNT(*) FROM subscriptions WHERE idea_id = ? AND LOWER(user_email) = ?", req.TargetIdeaID, se).Scan(&subExists)
 		if subExists == 0 {
 			subID := uuid.New().String()
-			_, _ = tx.Exec("INSERT INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, req.TargetIdeaID, se, now)
+			if _, err := tx.Exec("INSERT INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, req.TargetIdeaID, se, now); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to transfer subscription: " + err.Error()})
+			}
 		}
+	}
+
+	// Transactionally remove stale alias subscriptions across source and its merged children
+	if _, err := tx.Exec(`
+		DELETE FROM subscriptions
+		WHERE idea_id = ? OR idea_id IN (SELECT id FROM ideas WHERE merged_into_id = ?)
+	`, req.SourceIdeaID, req.SourceIdeaID); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to clean alias subscriptions: " + err.Error()})
 	}
 
 	// Compute consolidated upvotes accurately
@@ -915,6 +990,28 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 		VALUES (?, ?, ?, 'merged', 'Admin (Merge Engine)', ?, ?)
 	`, uuid.New().String(), req.SourceIdeaID, sourceStatus, note, now); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to record audit status: " + err.Error()})
+	}
+
+	// 4. Insert merge notification for source author and source subscribers
+	recipients := make(map[string]bool)
+	if cleanAuthor := strings.ToLower(strings.TrimSpace(sourceAuthorEmail)); cleanAuthor != "" {
+		recipients[cleanAuthor] = true
+	}
+	for _, se := range sourceSubs {
+		if se != "" {
+			recipients[se] = true
+		}
+	}
+
+	mergeMsg := fmt.Sprintf("Your feedback \"%s\" was merged into \"%s\". All upvotes have been consolidated into the canonical idea.", sourceTitle, targetTitle)
+	for rEmail := range recipients {
+		notifID := uuid.New().String()
+		if _, err := tx.Exec(`
+			INSERT INTO notifications (id, idea_id, recipient_email, event_type, title, message, status, created_at)
+			VALUES (?, ?, ?, 'merge', ?, ?, 'merged', ?)
+		`, notifID, req.TargetIdeaID, rEmail, targetTitle, mergeMsg, now); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to persist merge notification: " + err.Error()})
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1015,36 +1112,71 @@ func (h *Handler) ToggleSubscription(c *fiber.Ctx) error {
 		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
 	}
 
-	// Resolve canonical idea ID if merged
-	canonicalID := h.resolveCanonicalIdeaID(id)
+	// Resolve canonical idea ID and all related merge aliases
+	canonicalID, familyIDs := h.getMergeFamilyIDs(id)
 
-	var existingID string
-	err := h.db.DB.QueryRow("SELECT id FROM subscriptions WHERE (idea_id = ? OR idea_id = ?) AND LOWER(user_email) = ? LIMIT 1", canonicalID, id, email).Scan(&existingID)
-	alreadySubscribed := err == nil
+	var canonicalSubID string
+	err := h.db.DB.QueryRow("SELECT id FROM subscriptions WHERE idea_id = ? AND LOWER(user_email) = ?", canonicalID, email).Scan(&canonicalSubID)
+	subscribedToCanonical := (err == nil)
+
+	anyFamilySubscribed := subscribedToCanonical
+	if !anyFamilySubscribed {
+		for _, fid := range familyIDs {
+			var sid string
+			if h.db.DB.QueryRow("SELECT id FROM subscriptions WHERE idea_id = ? AND LOWER(user_email) = ?", fid, email).Scan(&sid) == nil {
+				anyFamilySubscribed = true
+				break
+			}
+		}
+	}
 
 	action := strings.ToLower(strings.TrimSpace(req.Action))
 	if action == "" {
 		action = "toggle"
 	}
 
-	if (action == "unsubscribe" || (action == "toggle" && alreadySubscribed)) && alreadySubscribed {
-		// Clean up subscriptions on both source and canonical destination
-		_, _ = h.db.DB.Exec("DELETE FROM subscriptions WHERE (idea_id = ? OR idea_id = ?) AND LOWER(user_email) = ?", canonicalID, id, email)
+	tx, err := h.db.DB.Begin()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to begin subscription transaction: " + err.Error()})
+	}
+	defer tx.Rollback()
+
+	if action == "unsubscribe" || (action == "toggle" && anyFamilySubscribed) {
+		for _, fid := range familyIDs {
+			if _, err := tx.Exec("DELETE FROM subscriptions WHERE idea_id = ? AND LOWER(user_email) = ?", fid, email); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to unsubscribe: " + err.Error()})
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to commit unsubscribe: " + err.Error()})
+		}
 		return c.JSON(fiber.Map{"subscribed": false, "message": "Unsubscribed successfully"})
 	}
 
-	if (action == "subscribe" || (action == "toggle" && !alreadySubscribed)) && !alreadySubscribed {
-		subID := uuid.New().String()
-		now := time.Now().UTC().Format(time.RFC3339)
-		// Record subscription against the canonical idea
-		_, err = h.db.DB.Exec("INSERT OR IGNORE INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, canonicalID, email, now)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": "Failed to record subscription: " + err.Error()})
+	if action == "subscribe" || (action == "toggle" && !anyFamilySubscribed) {
+		// Clean up any stale alias subscriptions across the family
+		for _, fid := range familyIDs {
+			if fid != canonicalID {
+				if _, err := tx.Exec("DELETE FROM subscriptions WHERE idea_id = ? AND LOWER(user_email) = ?", fid, email); err != nil {
+					return c.Status(500).JSON(fiber.Map{"error": "Failed to clean alias subscriptions: " + err.Error()})
+				}
+			}
+		}
+		// Ensure canonical idea has the subscription
+		if !subscribedToCanonical {
+			subID := uuid.New().String()
+			now := time.Now().UTC().Format(time.RFC3339)
+			if _, err := tx.Exec("INSERT INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, canonicalID, email, now); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to record subscription: " + err.Error()})
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to commit subscription: " + err.Error()})
 		}
 		return c.JSON(fiber.Map{"subscribed": true, "message": "Subscribed successfully"})
 	}
 
-	return c.JSON(fiber.Map{"subscribed": alreadySubscribed, "message": "Subscription state unchanged"})
+	return c.JSON(fiber.Map{"subscribed": subscribedToCanonical, "message": "Subscription state unchanged"})
 }
 
 // GET /api/notifications?email=user@example.com
