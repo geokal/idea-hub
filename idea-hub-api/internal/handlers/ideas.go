@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -343,8 +344,9 @@ func (h *Handler) CreateIdea(c *fiber.Ctx) error {
 		authorName = "Customer"
 	}
 	authorEmail := strings.TrimSpace(req.AuthorEmail)
-	if authorEmail == "" {
-		authorEmail = "customer@example.com"
+	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
+	if authorEmail == "" || !emailRegex.MatchString(authorEmail) {
+		return c.Status(400).JSON(fiber.Map{"error": "A valid author email address is required"})
 	}
 	category := strings.TrimSpace(req.Category)
 	if category == "" {
@@ -380,36 +382,98 @@ func (h *Handler) CreateIdea(c *fiber.Ctx) error {
 func (h *Handler) VoteIdea(c *fiber.Ctx) error {
 	id := c.Params("id")
 	type Request struct {
-		Action string `json:"action"` // "add" or "remove"
+		Action   string `json:"action"`   // "add" or "remove"
+		VoterKey string `json:"voterKey"` // unique voter identifier or email
 	}
 	var req Request
 	_ = c.BodyParser(&req)
 
-	delta := 1
-	if strings.ToLower(strings.TrimSpace(req.Action)) == "remove" {
-		delta = -1
+	voterKey := strings.TrimSpace(req.VoterKey)
+	if voterKey == "" {
+		voterKey = strings.TrimSpace(c.Get("X-Voter-Key"))
+	}
+	if voterKey == "" {
+		voterKey = c.IP()
 	}
 
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	if action != "remove" {
+		action = "add"
+	}
+
+	tx, err := h.db.DB.Begin()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to begin vote transaction: " + err.Error()})
+	}
+	defer tx.Rollback()
+
 	var currentUpvotes int
-	err := h.db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", id).Scan(&currentUpvotes)
+	var status string
+	var mergedIntoID sql.NullString
+	err = tx.QueryRow("SELECT upvotes, status, merged_into_id FROM ideas WHERE id = ?", id).Scan(&currentUpvotes, &status, &mergedIntoID)
 	if err == sql.ErrNoRows {
 		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
 	} else if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	newUpvotes := currentUpvotes + delta
-	if newUpvotes < 0 {
-		newUpvotes = 0
+	targetIdeaID := id
+	if status == "merged" {
+		if mergedIntoID.Valid && mergedIntoID.String != "" {
+			targetIdeaID = mergedIntoID.String
+			err = tx.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", targetIdeaID).Scan(&currentUpvotes)
+			if err != nil {
+				return c.Status(409).JSON(fiber.Map{"error": "This idea has been merged and the canonical idea could not be loaded"})
+			}
+		} else {
+			return c.Status(409).JSON(fiber.Map{"error": "Cannot vote on a merged idea"})
+		}
 	}
 
+	var existingVoteID string
+	err = tx.QueryRow("SELECT id FROM votes WHERE idea_id = ? AND voter_key = ?", targetIdeaID, voterKey).Scan(&existingVoteID)
+	hasVoted := err == nil
+
+	newUpvotes := currentUpvotes
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err = h.db.DB.Exec("UPDATE ideas SET upvotes = ?, updated_at = ? WHERE id = ?", newUpvotes, now, id)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+
+	if action == "add" {
+		if !hasVoted {
+			newVoteID := uuid.New().String()
+			if _, err := tx.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", newVoteID, targetIdeaID, voterKey, now); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to record vote: " + err.Error()})
+			}
+			newUpvotes = currentUpvotes + 1
+			if _, err := tx.Exec("UPDATE ideas SET upvotes = ?, updated_at = ? WHERE id = ?", newUpvotes, now, targetIdeaID); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to update upvotes: " + err.Error()})
+			}
+		}
+	} else if action == "remove" {
+		if hasVoted {
+			if _, err := tx.Exec("DELETE FROM votes WHERE id = ?", existingVoteID); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to delete vote: " + err.Error()})
+			}
+			newUpvotes = currentUpvotes - 1
+			if newUpvotes < 0 {
+				newUpvotes = 0
+			}
+			if _, err := tx.Exec("UPDATE ideas SET upvotes = ?, updated_at = ? WHERE id = ?", newUpvotes, now, targetIdeaID); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to update upvotes: " + err.Error()})
+			}
+		}
 	}
 
-	return c.JSON(fiber.Map{"id": id, "upvotes": newUpvotes, "action": req.Action})
+	if err := tx.Commit(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to commit vote transaction: " + err.Error()})
+	}
+
+	return c.JSON(fiber.Map{
+		"id":         targetIdeaID,
+		"originalId": id,
+		"upvotes":    newUpvotes,
+		"action":     action,
+		"hasVoted":   action == "add",
+	})
 }
 
 // POST /api/ideas/:id/upvote (backward-compatible alias)
@@ -486,6 +550,38 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
+	// Persist server-side notification events for author and subscribers
+	var authorEmail, ideaTitle string
+	_ = tx.QueryRow("SELECT author_email, title FROM ideas WHERE id = ?", id).Scan(&authorEmail, &ideaTitle)
+
+	recipients := make(map[string]bool)
+	if authorEmail != "" {
+		recipients[authorEmail] = true
+	}
+	subRows, err := tx.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", id)
+	if err == nil {
+		defer subRows.Close()
+		for subRows.Next() {
+			var subEmail string
+			if err := subRows.Scan(&subEmail); err == nil && subEmail != "" {
+				recipients[subEmail] = true
+			}
+		}
+	}
+
+	notifMsg := fmt.Sprintf("Status changed to %s", req.Status)
+	if req.PublicNote != "" {
+		notifMsg = fmt.Sprintf("Status changed to %s: \"%s\"", req.Status, req.PublicNote)
+	}
+
+	for rEmail := range recipients {
+		notifID := uuid.New().String()
+		_, _ = tx.Exec(`
+			INSERT INTO notifications (id, idea_id, recipient_email, event_type, title, message, status, created_at)
+			VALUES (?, ?, ?, 'status_change', ?, ?, 'queued', ?)
+		`, notifID, id, rEmail, ideaTitle, notifMsg, now)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": "Failed to commit status change: " + err.Error()})
 	}
@@ -503,6 +599,12 @@ func (h *Handler) CreateComment(c *fiber.Ctx) error {
 	id := c.Params("id")
 	role := getAuthorizedRole(c)
 	isTeam := role == "team" || role == "admin"
+
+	// Verify target idea exists to prevent orphaned discussions
+	var exists int
+	if err := h.db.DB.QueryRow("SELECT COUNT(*) FROM ideas WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
+		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
+	}
 
 	type Request struct {
 		AuthorName  string `json:"authorName"`
@@ -561,6 +663,35 @@ func (h *Handler) CreateComment(c *fiber.Ctx) error {
 	`, newID, id, authorName, authorEmail, isTeamInt, isInternalInt, body, now)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// If team posted a public comment, enqueue notification for author and subscribers
+	if isTeam && !req.IsInternal {
+		var ideaAuthorEmail, ideaTitle string
+		_ = h.db.DB.QueryRow("SELECT author_email, title FROM ideas WHERE id = ?", id).Scan(&ideaAuthorEmail, &ideaTitle)
+
+		recipients := make(map[string]bool)
+		if ideaAuthorEmail != "" {
+			recipients[ideaAuthorEmail] = true
+		}
+		subRows, err := h.db.DB.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", id)
+		if err == nil {
+			defer subRows.Close()
+			for subRows.Next() {
+				var subEmail string
+				if err := subRows.Scan(&subEmail); err == nil && subEmail != "" {
+					recipients[subEmail] = true
+				}
+			}
+		}
+
+		for rEmail := range recipients {
+			notifID := uuid.New().String()
+			_, _ = h.db.DB.Exec(`
+				INSERT INTO notifications (id, idea_id, recipient_email, event_type, title, message, status, created_at)
+				VALUES (?, ?, ?, 'team_reply', ?, ?, 'queued', ?)
+			`, notifID, id, rEmail, ideaTitle, "Product team replied: "+body, now)
+		}
 	}
 
 	return c.Status(201).JSON(fiber.Map{
@@ -763,4 +894,45 @@ func (h *Handler) ToggleSubscription(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"subscribed": true, "message": "Subscribed successfully"})
+}
+
+// GET /api/notifications?email=user@example.com
+func (h *Handler) GetNotifications(c *fiber.Ctx) error {
+	email := strings.TrimSpace(strings.ToLower(c.Query("email")))
+	if email == "" {
+		return c.JSON([]fiber.Map{})
+	}
+
+	rows, err := h.db.DB.Query(`
+		SELECT id, idea_id, event_type, title, message, status, created_at
+		FROM notifications WHERE LOWER(recipient_email) = ?
+		ORDER BY created_at DESC LIMIT 50
+	`, email)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	defer rows.Close()
+
+	type NotificationDTO struct {
+		ID        string `json:"id"`
+		IdeaID    string `json:"ideaId"`
+		EventType string `json:"eventType"`
+		Title     string `json:"title"`
+		Message   string `json:"message"`
+		Status    string `json:"status"`
+		CreatedAt string `json:"createdAt"`
+	}
+
+	var results []NotificationDTO
+	for rows.Next() {
+		var n NotificationDTO
+		if err := rows.Scan(&n.ID, &n.IdeaID, &n.EventType, &n.Title, &n.Message, &n.Status, &n.CreatedAt); err == nil {
+			results = append(results, n)
+		}
+	}
+	if results == nil {
+		results = []NotificationDTO{}
+	}
+
+	return c.JSON(results)
 }

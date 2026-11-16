@@ -89,6 +89,27 @@ func (s *Service) initSchema() error {
 		FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE,
 		UNIQUE (idea_id, user_email)
 	);
+
+	CREATE TABLE IF NOT EXISTS votes (
+		id TEXT PRIMARY KEY,
+		idea_id TEXT NOT NULL,
+		voter_key TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE,
+		UNIQUE (idea_id, voter_key)
+	);
+
+	CREATE TABLE IF NOT EXISTS notifications (
+		id TEXT PRIMARY KEY,
+		idea_id TEXT NOT NULL,
+		recipient_email TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		title TEXT NOT NULL,
+		message TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'queued',
+		created_at TEXT NOT NULL,
+		FOREIGN KEY (idea_id) REFERENCES ideas(id) ON DELETE CASCADE
+	);
 	`
 	if _, err := s.DB.Exec(schema); err != nil {
 		return fmt.Errorf("failed to initialize schema: %w", err)

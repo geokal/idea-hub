@@ -81,6 +81,19 @@ import { IdeaStatus } from '../../models/idea.model';
           >
             {{ ideaService.showMerged() ? 'Hide Merged' : 'Show Merged' }} ({{ ideaService.mergedCount() }})
           </button>
+
+          <!-- Export CSV Button (Visible for Team / Admin) -->
+          <button
+            type="button"
+            (click)="ideaService.exportToCsv()"
+            class="flex items-center gap-1.5 text-xs px-3 py-2 rounded-xl border border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 text-stone-700 dark:text-stone-300 hover:bg-stone-50 dark:hover:bg-stone-800 transition-colors shadow-2xs font-medium cursor-pointer"
+            title="Export feedback list to CSV (Admin/Team)"
+          >
+            <svg class="w-3.5 h-3.5 text-stone-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+            <span>Export CSV</span>
+          </button>
         }
 
       </div>

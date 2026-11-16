@@ -148,10 +148,16 @@ export class IdeaService {
   }
 
   private _getHeaders(): HttpHeaders {
-    return new HttpHeaders({
-      'X-User-Role': this.currentRole(),
-      'Content-Type': 'application/json'
+    let headers = new HttpHeaders({
+      'Content-Type': 'application/json',
+      'X-Voter-Key': CURRENT_CUSTOMER_EMAIL
     });
+    const role = this.currentRole();
+    if (role === 'team' || role === 'admin') {
+      headers = headers.set('X-User-Role', role)
+                       .set('X-Admin-Key', 'ideahub-admin-dev-secret');
+    }
+    return headers;
   }
 
   // Refresh ideas list from Go backend
@@ -180,6 +186,7 @@ export class IdeaService {
             }
           }
 
+          const isTeam = this.isTeamMember();
           const backendList: ProductIdea[] = dtos.map(dto => {
             const prev = existingMap.get(dto.id);
             return {
@@ -189,14 +196,16 @@ export class IdeaService {
               category: dto.category,
               status: dto.status,
               authorName: dto.authorName,
-              authorEmail: dto.authorEmail || prev?.authorEmail || (dto.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''),
+              authorEmail: isTeam
+                ? (dto.authorEmail || prev?.authorEmail || '')
+                : (dto.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''),
               upvotes: dto.upvotes,
               upvotedByUser: prev ? prev.upvotedByUser : false,
               subscribedUserEmails: prev?.subscribedUserEmails || [CURRENT_CUSTOMER_EMAIL],
               createdAt: dto.createdAt,
               comments: prev?.comments || [],
               commentsCount: dto.commentsCount,
-              internalNotes: prev?.internalNotes || [],
+              internalNotes: isTeam ? (prev?.internalNotes || []) : [],
               statusHistory: prev?.statusHistory || [],
               mergedIntoId: dto.mergedIntoId,
               mergedIntoTitle: dto.mergedIntoTitle
@@ -226,6 +235,7 @@ export class IdeaService {
           // Reject stale response that precedes a newer edit
           if (this._ideaDetailSeq.get(id) !== currentSeq) return;
 
+          const isTeam = this.isTeamMember();
           this._ideas.update(list =>
             list.map(idea => {
               if (idea.id !== id) return idea;
@@ -236,7 +246,9 @@ export class IdeaService {
                 category: detail.category,
                 status: detail.status,
                 authorName: detail.authorName,
-                authorEmail: detail.authorEmail || idea.authorEmail,
+                authorEmail: isTeam
+                  ? (detail.authorEmail || idea.authorEmail)
+                  : (detail.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''),
                 upvotes: detail.upvotes,
                 commentsCount: detail.comments?.length ?? detail.commentsCount,
                 mergedIntoId: detail.mergedIntoId,
@@ -247,18 +259,18 @@ export class IdeaService {
                 comments: (detail.comments || []).map(c => ({
                   id: c.id,
                   authorName: c.authorName,
-                  authorEmail: c.authorEmail || '',
+                  authorEmail: isTeam ? (c.authorEmail || '') : '',
                   isTeamMember: c.isTeamMember,
                   content: c.content,
                   createdAt: c.createdAt
                 })),
-                internalNotes: (detail.internalNotes || []).map(n => ({
+                internalNotes: isTeam ? (detail.internalNotes || []).map(n => ({
                   id: n.id,
                   authorName: n.authorName,
                   authorEmail: n.authorEmail || '',
                   content: n.content,
                   createdAt: n.createdAt
-                })),
+                })) : [],
                 statusHistory: (detail.statusHistory || []).map(h => ({
                   id: h.id,
                   previousStatus: h.previousStatus,
@@ -342,6 +354,23 @@ export class IdeaService {
     try {
       localStorage.setItem(STORAGE_ROLE_KEY, role);
     } catch {}
+
+    if (role === 'customer') {
+      // Immediate confidentiality scrub: Strip all internal notes and private emails
+      this._ideas.update(list =>
+        list.map(i => ({
+          ...i,
+          internalNotes: [],
+          authorEmail: i.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : '',
+          comments: i.comments.map(c => ({
+            ...c,
+            authorEmail: c.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''
+          }))
+        }))
+      );
+      this._saveIdeas();
+    }
+
     this.refreshIdeas();
     const activeId = this.selectedIdeaId();
     if (activeId) {
@@ -472,16 +501,17 @@ export class IdeaService {
 
     const action = willBeUpvoted ? 'add' : 'remove';
 
-    // Sync to Go Fiber API using distinct add/remove action
+    // Sync to Go Fiber API using distinct add/remove action and identified voter key
     this.http.post<{ id: string; upvotes: number; action?: string }>(
       `${this.API_BASE}/ideas/${ideaId}/vote`,
-      { action },
+      { action, voterKey: CURRENT_CUSTOMER_EMAIL },
       { headers: this._getHeaders() }
     ).subscribe({
       next: (res) => {
         if (res && typeof res.upvotes === 'number') {
+          const targetId = res.id || ideaId;
           this._ideas.update(list =>
-            list.map(i => i.id === ideaId ? { ...i, upvotes: res.upvotes } : i)
+            list.map(i => (i.id === targetId || i.id === ideaId) ? { ...i, upvotes: res.upvotes } : i)
           );
           this._saveIdeas();
         }
@@ -829,6 +859,30 @@ export class IdeaService {
 
   // Export to CSV (Section 8 of SPEC.MD)
   exportToCsv(): void {
+    if (this.isAdmin()) {
+      this.http.get(`${this.API_BASE}/export/csv`, {
+        headers: this._getHeaders(),
+        responseType: 'blob'
+      }).subscribe({
+        next: (blob) => {
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.setAttribute('href', url);
+          link.setAttribute('download', `ideahub-feedback-export-${new Date().toISOString().slice(0, 10)}.csv`);
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        },
+        error: () => this._generateClientCsv()
+      });
+      return;
+    }
+
+    this._generateClientCsv();
+  }
+
+  private _generateClientCsv(): void {
     const list = this._ideas();
     const headers = ['Title', 'Category', 'Status', 'Vote Count', 'Submission Date', 'Submitter Display Name', 'Submitter Email'];
     
@@ -841,6 +895,7 @@ export class IdeaService {
       return `"${str.replace(/"/g, '""')}"`;
     };
 
+    const isTeam = this.isTeamMember();
     const rows = list.map(i => [
       escapeCsvCell(i.title),
       escapeCsvCell(i.category),
@@ -848,7 +903,7 @@ export class IdeaService {
       i.upvotes,
       escapeCsvCell(i.createdAt),
       escapeCsvCell(i.authorName),
-      escapeCsvCell(i.authorEmail),
+      escapeCsvCell(isTeam ? i.authorEmail : (i.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : '***@***.***')),
     ]);
 
     const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
