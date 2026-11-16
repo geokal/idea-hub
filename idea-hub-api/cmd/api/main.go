@@ -15,7 +15,10 @@ import (
 
 func main() {
 	// Initialize SQLite Database with WAL mode & Seed data
-	db := database.New()
+	db, err := database.New()
+	if err != nil {
+		log.Fatalf("Fatal: failed to initialize database: %v", err)
+	}
 	defer db.DB.Close()
 
 	// Initialize Fiber App
@@ -49,6 +52,7 @@ func main() {
 	api.Get("/ideas/:id", h.GetIdeaByID)
 	api.Post("/ideas", h.CreateIdea)
 	api.Post("/ideas/:id/upvote", h.UpvoteIdea)
+	api.Post("/ideas/:id/vote", h.VoteIdea)
 	api.Post("/ideas/:id/subscribe", h.ToggleSubscription)
 	api.Post("/ideas/:id/status", h.UpdateStatus)
 	api.Post("/ideas/:id/comments", h.CreateComment)

@@ -40,8 +40,14 @@ import { IdeaService } from '../../services/idea.service';
 
         <!-- Center: Title & Description -->
         <div class="flex-1 min-w-0 pr-2">
-          <h2 class="text-sm sm:text-base font-semibold text-stone-900 dark:text-stone-100 group-hover:text-[#1B4D3E] dark:group-hover:text-emerald-400 transition-colors truncate">
-            {{ idea().title }}
+          <h2 class="text-sm sm:text-base font-semibold truncate">
+            <button
+              type="button"
+              (click)="selectIdea($event)"
+              class="text-left font-semibold text-stone-900 dark:text-stone-100 group-hover:text-[#1B4D3E] dark:group-hover:text-emerald-400 transition-colors truncate max-w-full focus:outline-none focus-visible:underline"
+            >
+              {{ idea().title }}
+            </button>
           </h2>
           <p class="text-xs sm:text-sm text-stone-500 dark:text-stone-400 mt-0.5 line-clamp-1 leading-relaxed">
             {{ idea().description }}
@@ -51,7 +57,7 @@ import { IdeaService } from '../../services/idea.service';
           <div class="flex items-center gap-2.5 mt-1.5 text-[11px] text-stone-400 dark:text-stone-500">
             <span>by {{ idea().authorName }}</span>
             <span>·</span>
-            <span>{{ idea().comments.length }} comment{{ idea().comments.length === 1 ? '' : 's' }}</span>
+            <span>{{ commentCount }} comment{{ commentCount === 1 ? '' : 's' }}</span>
             
             @if (ideaService.isTeamMember() && (idea().internalNotes?.length || 0) > 0) {
               <span class="text-amber-600 dark:text-amber-400 font-medium">
@@ -119,6 +125,15 @@ import { IdeaService } from '../../services/idea.service';
 export class IdeaCardComponent {
   readonly idea = input.required<ProductIdea>();
   readonly ideaService = inject(IdeaService);
+
+  get commentCount(): number {
+    return this.idea().commentsCount ?? this.idea().comments?.length ?? 0;
+  }
+
+  selectIdea(event?: Event): void {
+    if (event) event.stopPropagation();
+    this.ideaService.selectedIdeaId.set(this.idea().id);
+  }
 
   statusLabel(status: string): string {
     switch (status) {

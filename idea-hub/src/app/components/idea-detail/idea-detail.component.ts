@@ -1,8 +1,15 @@
-import { Component, inject, signal, computed, HostListener } from '@angular/core';
+import { Component, inject, signal, computed, HostListener, effect, viewChild, ElementRef } from '@angular/core';
 import { DatePipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { IdeaService } from '../../services/idea.service';
 import { IdeaStatus } from '../../models/idea.model';
+
+interface IdeaDrafts {
+  publicComment: string;
+  internalNote: string;
+  mergeTargetId: string;
+  mergeReason: string;
+}
 
 @Component({
   selector: 'app-idea-detail',
@@ -14,8 +21,14 @@ import { IdeaStatus } from '../../models/idea.model';
         (click)="close()"
       >
         <div
-          class="relative w-full max-w-2xl max-h-[92vh] bg-white dark:bg-[#1C1C1A] rounded-3xl shadow-2xl border border-stone-200/80 dark:border-stone-800 flex flex-col overflow-hidden"
+          #detailDialog
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="idea-detail-title"
+          tabindex="-1"
+          class="relative w-full max-w-2xl max-h-[92vh] bg-white dark:bg-[#1C1C1A] rounded-3xl shadow-2xl border border-stone-200/80 dark:border-stone-800 flex flex-col overflow-hidden outline-none"
           (click)="$event.stopPropagation()"
+          (keydown)="onKeydown($event)"
         >
           <!-- Modal Top Header -->
           <div class="flex items-start justify-between p-5 sm:p-6 border-b border-stone-100 dark:border-stone-800/80">
@@ -80,7 +93,7 @@ import { IdeaStatus } from '../../models/idea.model';
                 </span>
               </div>
 
-              <h1 class="text-xl sm:text-2xl font-serif text-stone-900 dark:text-stone-100 font-normal leading-snug">
+              <h1 id="idea-detail-title" class="text-xl sm:text-2xl font-serif text-stone-900 dark:text-stone-100 font-normal leading-snug">
                 {{ idea.title }}
               </h1>
             </div>
@@ -506,6 +519,11 @@ import { IdeaStatus } from '../../models/idea.model';
 })
 export class IdeaDetailComponent {
   readonly ideaService = inject(IdeaService);
+  readonly detailDialog = viewChild<ElementRef<HTMLElement>>('detailDialog');
+
+  private previousFocusedElement: HTMLElement | null = null;
+  private currentDraftIdeaId: string | null = null;
+  private draftsByIdeaId = new Map<string, IdeaDrafts>();
 
   readonly availableStatuses: { id: IdeaStatus; label: string }[] = [
     { id: 'under-review', label: 'Under Review' },
@@ -531,6 +549,83 @@ export class IdeaDetailComponent {
     return this.ideaService.ideas().filter(i => i.id !== current.id && i.status !== 'merged');
   });
 
+  constructor() {
+    effect(() => {
+      const currentId = this.ideaService.selectedIdeaId();
+
+      // If switching away from an idea, persist its draft
+      if (this.currentDraftIdeaId && this.currentDraftIdeaId !== currentId) {
+        this.draftsByIdeaId.set(this.currentDraftIdeaId, {
+          publicComment: this.newPublicCommentText,
+          internalNote: this.newInternalNoteText,
+          mergeTargetId: this.mergeTargetIdeaId,
+          mergeReason: this.mergeReasonNote,
+        });
+      }
+
+      this.currentDraftIdeaId = currentId;
+
+      if (currentId) {
+        // Remember previous focus opener if not already set
+        if (!this.previousFocusedElement && typeof document !== 'undefined') {
+          this.previousFocusedElement = document.activeElement as HTMLElement | null;
+        }
+
+        // Restore draft for this idea if present, or clear
+        const draft = this.draftsByIdeaId.get(currentId);
+        this.newPublicCommentText = draft?.publicComment || '';
+        this.newInternalNoteText = draft?.internalNote || '';
+        this.mergeTargetIdeaId = draft?.mergeTargetId || '';
+        this.mergeReasonNote = draft?.mergeReason || '';
+
+        // Transfer focus into dialog
+        setTimeout(() => {
+          const dialogEl = this.detailDialog()?.nativeElement;
+          if (dialogEl) {
+            const focusable = dialogEl.querySelector<HTMLElement>('button, [href], input, select, textarea');
+            if (focusable) {
+              focusable.focus();
+            } else {
+              dialogEl.focus();
+            }
+          }
+        }, 0);
+      } else {
+        this.newPublicCommentText = '';
+        this.newInternalNoteText = '';
+        this.mergeTargetIdeaId = '';
+        this.mergeReasonNote = '';
+
+        // Restore focus to opener
+        if (this.previousFocusedElement) {
+          this.previousFocusedElement.focus();
+          this.previousFocusedElement = null;
+        }
+      }
+    });
+  }
+
+  onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Tab') {
+      const dialogEl = this.detailDialog()?.nativeElement;
+      if (!dialogEl) return;
+      const focusableEls = dialogEl.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusableEls.length === 0) return;
+      const first = focusableEls[0];
+      const last = focusableEls[focusableEls.length - 1];
+
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
   @HostListener('document:keydown.escape')
   onEscape(): void {
     this.close();
@@ -550,6 +645,11 @@ export class IdeaDetailComponent {
     this.ideaService.mergeIdeas(sourceIdeaId, this.mergeTargetIdeaId, this.mergeReasonNote);
     this.mergeReasonNote = '';
     this.mergeTargetIdeaId = '';
+    const d = this.draftsByIdeaId.get(sourceIdeaId);
+    if (d) {
+      d.mergeTargetId = '';
+      d.mergeReason = '';
+    }
   }
 
   confirmDelete(ideaId: string): void {
@@ -562,11 +662,15 @@ export class IdeaDetailComponent {
     if (!this.newPublicCommentText.trim()) return;
     this.ideaService.addPublicComment(ideaId, this.newPublicCommentText);
     this.newPublicCommentText = '';
+    const d = this.draftsByIdeaId.get(ideaId);
+    if (d) d.publicComment = '';
   }
 
   submitInternalNote(ideaId: string): void {
     if (!this.newInternalNoteText.trim()) return;
     this.ideaService.addInternalNote(ideaId, this.newInternalNoteText);
     this.newInternalNoteText = '';
+    const d = this.draftsByIdeaId.get(ideaId);
+    if (d) d.internalNote = '';
   }
 }

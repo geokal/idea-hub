@@ -69,7 +69,7 @@ import { IdeaStatus } from '../../models/idea.model';
         @if (ideaService.isTeamMember()) {
           <button
             type="button"
-            (click)="ideaService.showMerged.update(v => !v)"
+            (click)="ideaService.toggleShowMerged()"
             class="text-xs px-3 py-2 rounded-xl border border-stone-200 dark:border-stone-800 transition-colors"
             [class.bg-purple-50]="ideaService.showMerged()"
             [class.border-purple-300]="ideaService.showMerged()"

@@ -157,7 +157,8 @@ export class IdeaService {
   // Refresh ideas list from Go backend
   refreshIdeas(): void {
     const reqRevision = ++this._listRevision;
-    this.http.get<IdeaBackendDTO[]>(`${this.API_BASE}/ideas`, { headers: this._getHeaders() })
+    const queryParams = this.showMerged() ? '?include_merged=true' : '';
+    this.http.get<IdeaBackendDTO[]>(`${this.API_BASE}/ideas${queryParams}`, { headers: this._getHeaders() })
       .subscribe({
         next: (dtos) => {
           if (!dtos) return;
@@ -448,10 +449,12 @@ export class IdeaService {
     this._listRevision++;
 
     let nextUpvotes = 0;
+    let willBeUpvoted = false;
     this._ideas.update(list =>
       list.map(idea => {
         if (idea.id !== ideaId) return idea;
         const upvoted = !idea.upvotedByUser;
+        willBeUpvoted = upvoted;
         const newSubs = upvoted
           ? Array.from(new Set([...idea.subscribedUserEmails, CURRENT_CUSTOMER_EMAIL]))
           : idea.subscribedUserEmails;
@@ -467,10 +470,12 @@ export class IdeaService {
     );
     this._saveIdeas();
 
-    // Sync to Go Fiber API
-    this.http.post<{ id: string; upvotes: number }>(
-      `${this.API_BASE}/ideas/${ideaId}/upvote`,
-      {},
+    const action = willBeUpvoted ? 'add' : 'remove';
+
+    // Sync to Go Fiber API using distinct add/remove action
+    this.http.post<{ id: string; upvotes: number; action?: string }>(
+      `${this.API_BASE}/ideas/${ideaId}/vote`,
+      { action },
       { headers: this._getHeaders() }
     ).subscribe({
       next: (res) => {
@@ -482,7 +487,7 @@ export class IdeaService {
         }
       },
       error: (err) => {
-        console.warn('Upvote API sync error:', err);
+        console.warn('Vote API sync error:', err);
       }
     });
   }
@@ -814,19 +819,36 @@ export class IdeaService {
     });
   }
 
+  toggleShowMerged(): void {
+    const willShow = !this.showMerged();
+    this.showMerged.set(willShow);
+    if (willShow) {
+      this.refreshIdeas();
+    }
+  }
+
   // Export to CSV (Section 8 of SPEC.MD)
   exportToCsv(): void {
     const list = this._ideas();
     const headers = ['Title', 'Category', 'Status', 'Vote Count', 'Submission Date', 'Submitter Display Name', 'Submitter Email'];
     
+    const escapeCsvCell = (val: string | number): string => {
+      let str = String(val ?? '');
+      // Prevent CSV formula injection by prefixing with an apostrophe if it starts with =, +, -, @, \t, or \r
+      if (/^[=+\-@\t\r]/.test(str)) {
+        str = "'" + str;
+      }
+      return `"${str.replace(/"/g, '""')}"`;
+    };
+
     const rows = list.map(i => [
-      `"${i.title.replace(/"/g, '""')}"`,
-      `"${i.category}"`,
-      `"${this.formatStatusLabel(i.status)}"`,
+      escapeCsvCell(i.title),
+      escapeCsvCell(i.category),
+      escapeCsvCell(this.formatStatusLabel(i.status)),
       i.upvotes,
-      `"${i.createdAt}"`,
-      `"${i.authorName.replace(/"/g, '""')}"`,
-      `"${i.authorEmail.replace(/"/g, '""')}"`,
+      escapeCsvCell(i.createdAt),
+      escapeCsvCell(i.authorName),
+      escapeCsvCell(i.authorEmail),
     ]);
 
     const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');

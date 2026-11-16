@@ -140,7 +140,7 @@ Before IdeaHub, product teams suffered from:
 ## Prerequisites
 
 Ensure you have the following installed on your machine:
-* **Node.js**: `v20.x` or later
+* **Node.js**: `^20.19.0 || ^22.12.0 || ^24.0.0` (officially supported by Angular 22)
 * **pnpm**: `v10.x` or later (`npm install -g pnpm`)
 * **Go**: `v1.24` or later
 * **CGO Compiler**: MinGW-w64 GCC (required for building `go-sqlite3` on Windows)
@@ -181,14 +181,18 @@ go build -v -o api.exe ./cmd/api
 ```
 Run the compiled binary:
 ```bash
+# On Windows PowerShell:
 .\api.exe
+# On Unix / Git Bash:
+./api.exe
 ```
 
 ### 4. Environment Variables & Ports
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8080` | Port for Fiber HTTP server |
-| `DB_NAME` | `feedback.db` | SQLite database file location |
+| `DB_PATH` | `feedback.db` | SQLite database file location |
+| `ADMIN_API_KEY` | `ideahub-admin-dev-secret` | Shared secret for team/admin authentication |
 
 ### 5. SQLite WAL Database Persistence
 The API uses SQLite with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`). When running, SQLite generates:
@@ -305,7 +309,7 @@ CREATE TABLE IF NOT EXISTS ideas (
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     category TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'under-review',
+    status TEXT NOT NULL,
     author_name TEXT NOT NULL,
     author_email TEXT NOT NULL,
     upvotes INTEGER NOT NULL DEFAULT 1,
@@ -336,6 +340,15 @@ CREATE TABLE IF NOT EXISTS status_changes (
     public_note TEXT,
     created_at DATETIME NOT NULL,
     FOREIGN KEY(idea_id) REFERENCES ideas(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id TEXT PRIMARY KEY,
+    idea_id TEXT NOT NULL,
+    user_email TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    FOREIGN KEY(idea_id) REFERENCES ideas(id) ON DELETE CASCADE,
+    UNIQUE(idea_id, user_email)
 );
 ```
 

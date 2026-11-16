@@ -81,26 +81,41 @@ func maskEmail(email string) string {
 	return "*@" + parts[1]
 }
 
+func sanitizeCSVCell(val string) string {
+	if val == "" {
+		return val
+	}
+	first := val[0]
+	if first == '=' || first == '+' || first == '-' || first == '@' || first == '\t' || first == '\r' {
+		return "'" + val
+	}
+	return val
+}
+
 func getAuthorizedRole(c *fiber.Ctx) string {
-	role := strings.ToLower(strings.TrimSpace(c.Get("X-User-Role", "customer")))
-	if role != "admin" && role != "team" {
-		return "customer"
+	adminKey := os.Getenv("ADMIN_API_KEY")
+	if adminKey == "" {
+		adminKey = "ideahub-admin-dev-secret"
 	}
 
-	adminKey := os.Getenv("ADMIN_API_KEY")
-	if adminKey != "" {
-		providedKey := c.Get("X-Admin-Key")
-		if providedKey == "" {
-			authHeader := c.Get("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				providedKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
-		if providedKey != adminKey {
-			return "customer"
+	providedKey := c.Get("X-Admin-Key")
+	if providedKey == "" {
+		authHeader := c.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			providedKey = strings.TrimPrefix(authHeader, "Bearer ")
 		}
 	}
-	return role
+
+	if providedKey != "" && providedKey == adminKey {
+		requestedRole := strings.ToLower(strings.TrimSpace(c.Get("X-User-Role", "admin")))
+		if requestedRole == "team" {
+			return "team"
+		}
+		return "admin"
+	}
+
+	// Strictly treat unauthenticated or untrusted requests as customer
+	return "customer"
 }
 
 // GET /api/ideas
@@ -121,12 +136,14 @@ func (h *Handler) GetIdeas(c *fiber.Ctx) error {
 	`
 	var args []interface{}
 
+	includeMerged := c.Query("include_merged") == "true" || c.Query("all") == "true"
+
 	if statusFilter != "all" {
 		query += " AND i.status = ?"
 		args = append(args, statusFilter)
 	} else {
-		// By default hide merged unless searching
-		if search == "" {
+		// By default hide merged unless searching or include_merged is requested
+		if search == "" && !includeMerged {
 			query += " AND i.status != 'merged'"
 		}
 	}
@@ -359,29 +376,52 @@ func (h *Handler) CreateIdea(c *fiber.Ctx) error {
 	})
 }
 
-// POST /api/ideas/:id/upvote
-func (h *Handler) UpvoteIdea(c *fiber.Ctx) error {
+// POST /api/ideas/:id/vote
+func (h *Handler) VoteIdea(c *fiber.Ctx) error {
 	id := c.Params("id")
-	res, err := h.db.DB.Exec("UPDATE ideas SET upvotes = upvotes + 1 WHERE id = ?", id)
+	type Request struct {
+		Action string `json:"action"` // "add" or "remove"
+	}
+	var req Request
+	_ = c.BodyParser(&req)
+
+	delta := 1
+	if strings.ToLower(strings.TrimSpace(req.Action)) == "remove" {
+		delta = -1
+	}
+
+	var currentUpvotes int
+	err := h.db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", id).Scan(&currentUpvotes)
+	if err == sql.ErrNoRows {
+		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
+	} else if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	newUpvotes := currentUpvotes + delta
+	if newUpvotes < 0 {
+		newUpvotes = 0
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = h.db.DB.Exec("UPDATE ideas SET upvotes = ?, updated_at = ? WHERE id = ?", newUpvotes, now, id)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
-	rowsAffected, _ := res.RowsAffected()
-	if rowsAffected == 0 {
-		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
-	}
 
-	var newUpvotes int
-	_ = h.db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", id).Scan(&newUpvotes)
+	return c.JSON(fiber.Map{"id": id, "upvotes": newUpvotes, "action": req.Action})
+}
 
-	return c.JSON(fiber.Map{"id": id, "upvotes": newUpvotes})
+// POST /api/ideas/:id/upvote (backward-compatible alias)
+func (h *Handler) UpvoteIdea(c *fiber.Ctx) error {
+	return h.VoteIdea(c)
 }
 
 // POST /api/ideas/:id/status
 func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 	role := getAuthorizedRole(c)
 	if role != "team" && role != "admin" {
-		return c.Status(403).JSON(fiber.Map{"error": "Unauthorized: requires team or admin role"})
+		return c.Status(403).JSON(fiber.Map{"error": "Unauthorized: requires verified team or admin role"})
 	}
 
 	id := c.Params("id")
@@ -395,10 +435,31 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "Invalid payload"})
 	}
 
+	validStatuses := map[string]bool{
+		"under-review": true,
+		"planned":      true,
+		"in-progress":   true,
+		"completed":    true,
+		"declined":     true,
+	}
+	if !validStatuses[req.Status] {
+		return c.Status(400).JSON(fiber.Map{
+			"error": "Invalid status. Allowed values: under-review, planned, in-progress, completed, declined",
+		})
+	}
+
+	tx, err := h.db.DB.Begin()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to begin transaction: " + err.Error()})
+	}
+	defer tx.Rollback()
+
 	var prevStatus string
-	err := h.db.DB.QueryRow("SELECT status FROM ideas WHERE id = ?", id).Scan(&prevStatus)
+	err = tx.QueryRow("SELECT status FROM ideas WHERE id = ?", id).Scan(&prevStatus)
 	if err == sql.ErrNoRows {
 		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
+	} else if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -411,16 +472,23 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 		}
 	}
 
-	_, err = h.db.DB.Exec("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", req.Status, now, id)
+	_, err = tx.Exec("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", req.Status, now, id)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	changeID := uuid.New().String()
-	_, _ = h.db.DB.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO status_changes (id, idea_id, from_status, to_status, changed_by, public_note, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, changeID, id, prevStatus, req.Status, changedBy, req.PublicNote, now)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if err := tx.Commit(); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to commit status change: " + err.Error()})
+	}
 
 	return c.JSON(fiber.Map{
 		"id":         id,
@@ -549,7 +617,7 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 	}
 
 	if sourceStatus == "merged" {
-		return c.Status(400).JSON(fiber.Map{"error": "Source idea has already been merged"})
+		return c.Status(409).JSON(fiber.Map{"error": "Source idea has already been merged"})
 	}
 
 	var targetTitle, targetStatus string
@@ -561,7 +629,7 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 	}
 
 	if targetStatus == "merged" {
-		return c.Status(400).JSON(fiber.Map{"error": "Cannot merge into an idea that is already merged"})
+		return c.Status(409).JSON(fiber.Map{"error": "Cannot merge into an idea that is already merged"})
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -622,7 +690,9 @@ func (h *Handler) DeleteIdea(c *fiber.Ctx) error {
 // GET /api/export/csv (Section 8 of SPEC.MD)
 func (h *Handler) ExportCSV(c *fiber.Ctx) error {
 	role := getAuthorizedRole(c)
-	isTeam := role == "team" || role == "admin"
+	if role != "admin" {
+		return c.Status(403).JSON(fiber.Map{"error": "Unauthorized: Only administrators can export feedback CSV"})
+	}
 
 	rows, err := h.db.DB.Query(`
 		SELECT title, category, status, upvotes, created_at, author_name, author_email
@@ -642,12 +712,16 @@ func (h *Handler) ExportCSV(c *fiber.Ctx) error {
 		var upvotes int
 		_ = rows.Scan(&title, &category, &status, &upvotes, &createdAt, &name, &email)
 
-		// Mask emails for non-team/admin users
-		if !isTeam {
-			email = maskEmail(email)
-		}
-
-		_ = writer.Write([]string{title, category, status, fmt.Sprintf("%d", upvotes), createdAt, name, email})
+		// Sanitize user-controlled fields against CSV injection
+		_ = writer.Write([]string{
+			sanitizeCSVCell(title),
+			sanitizeCSVCell(category),
+			sanitizeCSVCell(status),
+			fmt.Sprintf("%d", upvotes),
+			createdAt,
+			sanitizeCSVCell(name),
+			sanitizeCSVCell(email),
+		})
 	}
 	writer.Flush()
 

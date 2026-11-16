@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -13,7 +14,7 @@ type Service struct {
 	DB *sql.DB
 }
 
-func New() *Service {
+func New() (*Service, error) {
 	dbPath := "feedback.db"
 	if envPath := os.Getenv("DB_PATH"); envPath != "" {
 		dbPath = envPath
@@ -21,22 +22,26 @@ func New() *Service {
 
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
-		log.Fatalf("Fatal: failed to open SQLite database: %v", err)
+		return nil, fmt.Errorf("failed to open SQLite database: %w", err)
 	}
 
 	if _, err := db.Exec("PRAGMA foreign_keys = ON;"); err != nil {
-		log.Printf("Warning: failed to enforce SQLite foreign keys: %v", err)
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to enforce SQLite foreign keys: %w", err)
 	}
 
 	db.SetMaxOpenConns(1) // SQLite works best with 1 writer
 
 	s := &Service{DB: db}
-	s.initSchema()
+	if err := s.initSchema(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+	}
 	s.seedDataIfEmpty()
-	return s
+	return s, nil
 }
 
-func (s *Service) initSchema() {
+func (s *Service) initSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS ideas (
 		id TEXT PRIMARY KEY,
@@ -86,8 +91,9 @@ func (s *Service) initSchema() {
 	);
 	`
 	if _, err := s.DB.Exec(schema); err != nil {
-		log.Fatalf("Fatal: failed to initialize schema: %v", err)
+		return fmt.Errorf("failed to initialize schema: %w", err)
 	}
+	return nil
 }
 
 func (s *Service) seedDataIfEmpty() {

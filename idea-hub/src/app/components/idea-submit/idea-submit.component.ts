@@ -1,4 +1,4 @@
-import { Component, signal, inject, computed } from '@angular/core';
+import { Component, signal, inject, computed, effect, viewChild, ElementRef, HostListener } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { IdeaService } from '../../services/idea.service';
 import { IdeaCategory, ProductIdea } from '../../models/idea.model';
@@ -12,16 +12,21 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
       <div
         class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/50 backdrop-blur-xs transition-opacity animate-fade-in"
         (click)="close()"
-        (keydown.escape)="close()"
       >
         <div
-          class="relative w-full max-w-lg bg-[#FAF9F5] dark:bg-[#1A1A18] rounded-2xl p-6 sm:p-7 shadow-2xl border border-stone-200/90 dark:border-stone-800 transition-all text-stone-800 dark:text-stone-100 animate-scale-up"
+          #submitDialog
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="submit-modal-title"
+          tabindex="-1"
+          class="relative w-full max-w-lg max-h-[90vh] overflow-y-auto bg-[#FAF9F5] dark:bg-[#1A1A18] rounded-2xl p-6 sm:p-7 shadow-2xl border border-stone-200/90 dark:border-stone-800 transition-all text-stone-800 dark:text-stone-100 animate-scale-up outline-none"
           (click)="$event.stopPropagation()"
+          (keydown)="onKeydown($event)"
         >
           
           <!-- Modal Header -->
           <div class="flex items-center justify-between pb-4">
-            <h2 class="text-2xl font-serif font-bold text-stone-900 dark:text-stone-100 tracking-tight">
+            <h2 id="submit-modal-title" class="text-2xl font-serif font-bold text-stone-900 dark:text-stone-100 tracking-tight">
               Share your idea
             </h2>
             <button
@@ -184,13 +189,18 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
   `,
 })
 export class IdeaSubmitComponent {
+  private static readonly EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
   readonly ideaService = inject(IdeaService);
+  readonly submitDialog = viewChild<ElementRef<HTMLElement>>('submitDialog');
+
+  private previousFocusedElement: HTMLElement | null = null;
 
   readonly title = signal('');
   readonly description = signal('');
   readonly selectedCategory = signal<IdeaCategory>('Core Feature');
-  readonly authorName = signal('Jane Smith');
-  readonly authorEmail = signal('sarah.c@external.com');
+  readonly authorName = signal('');
+  readonly authorEmail = signal('');
   readonly potentialDuplicates = signal<ProductIdea[]>([]);
 
   readonly categories: IdeaCategory[] = [
@@ -204,8 +214,63 @@ export class IdeaSubmitComponent {
   readonly canSubmit = computed(() => {
     return this.title().trim().length >= 3 &&
            this.description().trim().length >= 5 &&
-           this.authorEmail().trim().includes('@');
+           IdeaSubmitComponent.EMAIL_REGEX.test(this.authorEmail().trim());
   });
+
+  constructor() {
+    effect(() => {
+      const isOpen = this.ideaService.isSubmitModalOpen();
+      if (isOpen) {
+        if (typeof document !== 'undefined') {
+          this.previousFocusedElement = document.activeElement as HTMLElement | null;
+        }
+        setTimeout(() => {
+          const dialogEl = this.submitDialog()?.nativeElement;
+          if (dialogEl) {
+            const firstInput = dialogEl.querySelector<HTMLElement>('input, textarea, button');
+            if (firstInput) {
+              firstInput.focus();
+            } else {
+              dialogEl.focus();
+            }
+          }
+        }, 0);
+      } else {
+        if (this.previousFocusedElement) {
+          this.previousFocusedElement.focus();
+          this.previousFocusedElement = null;
+        }
+      }
+    });
+  }
+
+  onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Tab') {
+      const dialogEl = this.submitDialog()?.nativeElement;
+      if (!dialogEl) return;
+      const focusableEls = dialogEl.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusableEls.length === 0) return;
+      const first = focusableEls[0];
+      const last = focusableEls[focusableEls.length - 1];
+
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
+  @HostListener('document:keydown.escape')
+  onEscape(): void {
+    if (this.ideaService.isSubmitModalOpen()) {
+      this.close();
+    }
+  }
 
   close(): void {
     this.ideaService.isSubmitModalOpen.set(false);
@@ -222,7 +287,10 @@ export class IdeaSubmitComponent {
   }
 
   upvoteDuplicate(dupId: string): void {
-    this.ideaService.toggleUpvote(dupId);
+    const dup = this.ideaService.ideas().find(i => i.id === dupId);
+    if (dup && !dup.upvotedByUser) {
+      this.ideaService.toggleUpvote(dupId);
+    }
     this.close();
   }
 
@@ -240,6 +308,8 @@ export class IdeaSubmitComponent {
 
     this.title.set('');
     this.description.set('');
+    this.authorName.set('');
+    this.authorEmail.set('');
     this.potentialDuplicates.set([]);
     this.close();
   }
