@@ -11,6 +11,10 @@ import {
   CustomerNotification,
   NotificationPreferences,
 } from '../models/idea.model';
+import { buildAuthHeaders } from '../utils/headers';
+import { sanitizeCsvCell } from '../utils/csv';
+import { detectDuplicates as runDuplicateDetection } from '../utils/duplicates';
+import { reconcilePendingSubmissions, reconcileNotifications, NotificationRecord } from '../utils/reconciliation';
 
 const STORAGE_IDEAS_KEY = 'ideahub_feedback_data_v3';
 const STORAGE_NOTIFS_KEY = 'ideahub_notifs_data_v3';
@@ -90,17 +94,26 @@ export class IdeaService {
 
   // 1. Perspective / Role & Admin Key
   readonly currentRole = signal<UserRole>(this._loadRole());
-  readonly adminApiKey = signal<string>(
-    typeof window !== 'undefined'
-      ? (sessionStorage.getItem('ideahub_admin_key') || '')
-      : ''
-  );
+  readonly authError = signal<string | null>(null);
+  readonly adminApiKey = signal<string>((() => {
+    try {
+      return typeof window !== 'undefined'
+        ? (sessionStorage.getItem('ideahub_admin_key') || '')
+        : '';
+    } catch {
+      return '';
+    }
+  })());
+
+  private readonly _readNotificationIds: Set<string> = this._loadReadNotificationIds();
 
   setAdminApiKey(key: string): void {
-    this.adminApiKey.set(key);
+    const trimmed = (key || '').trim();
+    this.adminApiKey.set(trimmed);
+    this.authError.set(null);
     try {
-      if (key) {
-        sessionStorage.setItem('ideahub_admin_key', key);
+      if (trimmed) {
+        sessionStorage.setItem('ideahub_admin_key', trimmed);
       } else {
         sessionStorage.removeItem('ideahub_admin_key');
       }
@@ -165,17 +178,14 @@ export class IdeaService {
   }
 
   private _getHeaders(): HttpHeaders {
-    let headers = new HttpHeaders({
-      'Content-Type': 'application/json',
-      'X-Voter-Key': CURRENT_CUSTOMER_EMAIL
-    });
-    const role = this.currentRole();
-    if (role === 'team' || role === 'admin') {
-      headers = headers.set('X-User-Role', role);
-      const key = this.adminApiKey();
-      if (key) {
-        headers = headers.set('X-Admin-Key', key);
-      }
+    const raw = buildAuthHeaders(
+      this.currentRole(),
+      this.adminApiKey(),
+      CURRENT_CUSTOMER_EMAIL
+    );
+    let headers = new HttpHeaders();
+    for (const [k, v] of Object.entries(raw)) {
+      headers = headers.set(k, v);
     }
     return headers;
   }
@@ -194,12 +204,8 @@ export class IdeaService {
           const existingMap = new Map(this._ideas().map(i => [i.id, i]));
 
           // Reconcile pending submissions with canonical backend IDs only by exact ID match
-          for (const dto of dtos) {
-            if (this._pendingSubmissions.has(dto.id)) {
-              this._pendingSubmissions.delete(dto.id);
-              this._savePendingSubmissions();
-            }
-          }
+          reconcilePendingSubmissions(dtos, this._pendingSubmissions);
+          this._savePendingSubmissions();
 
           const isTeam = this.isTeamMember();
           const backendList: ProductIdea[] = dtos.map(dto => {
@@ -306,13 +312,7 @@ export class IdeaService {
   }
 
   detectDuplicates(query: string): ProductIdea[] {
-    const q = query.trim().toLowerCase();
-    if (!q || q.length < 3) return [];
-    const words = q.split(/\s+/).filter(w => w.length > 2);
-    return this._ideas().filter(i => {
-      const titleLower = i.title.toLowerCase();
-      return words.some(w => titleLower.includes(w));
-    });
+    return runDuplicateDetection(query, this._ideas());
   }
 
   // Filtered Ideas Feed
@@ -404,7 +404,10 @@ export class IdeaService {
   }
 
   // Submit Feedback / Idea
-  submitIdea(params: { title: string; description: string; category: IdeaCategory; authorName: string; authorEmail: string }): ProductIdea {
+  submitIdea(
+    params: { title: string; description: string; category: IdeaCategory; authorName: string; authorEmail: string },
+    callbacks?: { onSuccess?: (idea: ProductIdea) => void; onError?: (err: any) => void }
+  ): ProductIdea {
     const authorEmail = params.authorEmail.trim() || CURRENT_CUSTOMER_EMAIL;
     const authorName = params.authorName.trim() || CURRENT_CUSTOMER_NAME;
     const tempId = crypto.randomUUID();
@@ -479,6 +482,7 @@ export class IdeaService {
           );
           this._saveIdeas();
         }
+        callbacks?.onSuccess?.(newIdea);
       },
       error: (err) => {
         if (err && err.status === 400) {
@@ -487,8 +491,10 @@ export class IdeaService {
           this._savePendingSubmissions();
           this._ideas.update(list => list.filter(i => i.id !== tempId));
           this._saveIdeas();
+          callbacks?.onError?.(err);
         } else {
           console.warn('Submit idea API sync error, preserved in pending storage for replay:', err);
+          callbacks?.onSuccess?.(newIdea);
         }
       }
     });
@@ -635,20 +641,6 @@ export class IdeaService {
     );
     this._saveIdeas();
 
-    // Trigger notification if team replies to idea
-    if (isTeam) {
-      const target = this._ideas().find(i => i.id === ideaId);
-      if (target) {
-        this._createNotification({
-          ideaId: target.id,
-          ideaTitle: target.title,
-          recipientEmail: target.authorEmail,
-          status: target.status,
-          message: `The product team replied to your feedback: "${trimmed.slice(0, 100)}${trimmed.length > 100 ? '...' : ''}"`,
-        });
-      }
-    }
-
     // Sync to Go Fiber API
     this.http.post<{ id: string }>(
       `${this.API_BASE}/ideas/${ideaId}/comments`,
@@ -662,8 +654,14 @@ export class IdeaService {
     ).subscribe({
       next: () => {
         this.fetchIdeaDetail(ideaId);
+        this.fetchNotifications();
       },
-      error: (err) => console.warn('Comment API sync error:', err)
+      error: (err) => {
+        if (err && err.status === 403) {
+          this.authError.set('Forbidden: Admin/Team key required for team replies.');
+        }
+        console.warn('Comment API sync error:', err);
+      }
     });
   }
 
@@ -712,7 +710,12 @@ export class IdeaService {
       next: () => {
         this.fetchIdeaDetail(ideaId);
       },
-      error: (err) => console.warn('Internal note API sync error:', err)
+      error: (err) => {
+        if (err && err.status === 403) {
+          this.authError.set('Forbidden: Admin/Team key required for internal notes.');
+        }
+        console.warn('Internal note API sync error:', err);
+      }
     });
   }
 
@@ -732,8 +735,6 @@ export class IdeaService {
     const changedBy = this.isAdmin() ? 'David Park (Admin)' : 'Sarah Johnson (Team)';
     const noteText = publicNote.trim() || `Status updated to ${this.formatStatusLabel(newStatus)}.`;
 
-    let targetIdea: ProductIdea | undefined;
-
     this._ideas.update(list =>
       list.map(idea => {
         if (idea.id !== ideaId) return idea;
@@ -747,13 +748,11 @@ export class IdeaService {
           timestamp: new Date().toISOString(),
         };
 
-        const updated = {
+        return {
           ...idea,
           status: newStatus,
           statusHistory: [historyItem, ...idea.statusHistory],
         };
-        targetIdea = updated;
-        return updated;
       })
     );
     this._saveIdeas();
@@ -769,13 +768,13 @@ export class IdeaService {
       { headers: this._getHeaders() }
     ).subscribe({
       next: () => {
-        // Dispatch notifications only after server accepts the status update
-        if (targetIdea) {
-          this._dispatchAsyncNotifications(targetIdea, newStatus, publicNote.trim());
-        }
         this.fetchIdeaDetail(ideaId);
+        this.fetchNotifications();
       },
       error: (err) => {
+        if (err && err.status === 403) {
+          this.authError.set('Forbidden: Admin/Team key required to update status.');
+        }
         console.warn('Status update API sync error, reverting local status:', err);
         // Recover local state from rejected status update
         this._ideas.update(list =>
@@ -850,14 +849,6 @@ export class IdeaService {
     );
     this._saveIdeas();
 
-    this._createNotification({
-      ideaId: target.id,
-      ideaTitle: target.title,
-      recipientEmail: source.authorEmail,
-      status: 'merged',
-      message: `Your feedback "${source.title}" was merged into "${target.title}". All upvotes have been consolidated into the canonical idea.`,
-    });
-
     // Sync to Go Fiber API
     this.http.post(
       `${this.API_BASE}/ideas/merge`,
@@ -871,8 +862,14 @@ export class IdeaService {
       next: () => {
         this.refreshIdeas();
         this.fetchIdeaDetail(target.id);
+        this.fetchNotifications();
       },
-      error: (err) => console.warn('Merge ideas API sync error:', err)
+      error: (err) => {
+        if (err && err.status === 403) {
+          this.authError.set('Forbidden: Admin/Team key required to merge feedback.');
+        }
+        console.warn('Merge ideas API sync error:', err);
+      }
     });
   }
 
@@ -890,7 +887,12 @@ export class IdeaService {
       `${this.API_BASE}/ideas/${ideaId}`,
       { headers: this._getHeaders() }
     ).subscribe({
-      error: (err) => console.warn('Delete idea API sync error:', err)
+      error: (err) => {
+        if (err && err.status === 403) {
+          this.authError.set('Forbidden: Admin key required to delete feedback.');
+        }
+        console.warn('Delete idea API sync error:', err);
+      }
     });
   }
 
@@ -930,25 +932,16 @@ export class IdeaService {
   private _generateClientCsv(): void {
     const list = this._ideas();
     const headers = ['Title', 'Category', 'Status', 'Vote Count', 'Submission Date', 'Submitter Display Name', 'Submitter Email'];
-    
-    const escapeCsvCell = (val: string | number): string => {
-      let str = String(val ?? '');
-      // Prevent CSV formula injection by prefixing with an apostrophe if it starts with =, +, -, @, \t, or \r
-      if (/^[=+\-@\t\r]/.test(str)) {
-        str = "'" + str;
-      }
-      return `"${str.replace(/"/g, '""')}"`;
-    };
 
     const isTeam = this.isTeamMember();
     const rows = list.map(i => [
-      escapeCsvCell(i.title),
-      escapeCsvCell(i.category),
-      escapeCsvCell(this.formatStatusLabel(i.status)),
+      sanitizeCsvCell(i.title),
+      sanitizeCsvCell(i.category),
+      sanitizeCsvCell(this.formatStatusLabel(i.status)),
       i.upvotes,
-      escapeCsvCell(i.createdAt),
-      escapeCsvCell(i.authorName),
-      escapeCsvCell(isTeam ? i.authorEmail : (i.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : '***@***.***')),
+      sanitizeCsvCell(i.createdAt),
+      sanitizeCsvCell(i.authorName),
+      sanitizeCsvCell(isTeam ? i.authorEmail : (i.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : '***@***.***')),
     ]);
 
     const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
@@ -965,13 +958,67 @@ export class IdeaService {
 
   // Notifications logic
   markNotificationRead(id: string): void {
+    this._readNotificationIds.add(id);
+    this._saveReadNotificationIds();
     this._notifications.update(list => list.map(n => (n.id === id ? { ...n, read: true } : n)));
     this._saveNotifications();
   }
 
   markAllNotificationsRead(): void {
+    for (const n of this._notifications()) {
+      this._readNotificationIds.add(n.id);
+    }
+    this._saveReadNotificationIds();
     this._notifications.update(list => list.map(n => ({ ...n, read: true })));
     this._saveNotifications();
+  }
+
+  private _loadReadNotificationIds(): Set<string> {
+    try {
+      const raw = localStorage.getItem('ideahub_read_notifs_v1');
+      if (raw) {
+        return new Set<string>(JSON.parse(raw));
+      }
+    } catch {}
+    return new Set<string>();
+  }
+
+  private _saveReadNotificationIds(): void {
+    try {
+      localStorage.setItem('ideahub_read_notifs_v1', JSON.stringify(Array.from(this._readNotificationIds)));
+    } catch {}
+  }
+
+  fetchNotifications(): void {
+    const email = CURRENT_CUSTOMER_EMAIL;
+    this.http.get<Array<{
+      id: string;
+      ideaId: string;
+      eventType?: string;
+      title?: string;
+      message: string;
+      status: string;
+      createdAt: string;
+    }>>(`${this.API_BASE}/notifications?email=${encodeURIComponent(email)}`, {
+      headers: this._getHeaders()
+    }).subscribe({
+      next: (serverNotifs) => {
+        if (!serverNotifs) return;
+        const reconciled = reconcileNotifications(
+          serverNotifs,
+          this._notifications() as NotificationRecord[],
+          this._readNotificationIds
+        );
+        this._notifications.set(reconciled as CustomerNotification[]);
+        this._saveNotifications();
+      },
+      error: (err) => {
+        if (err && err.status === 403) {
+          this.authError.set('Forbidden: unauthorized notification request.');
+        }
+        console.warn('Could not fetch server notifications:', err);
+      }
+    });
   }
 
   togglePreference(key: keyof NotificationPreferences): void {
@@ -1001,91 +1048,6 @@ export class IdeaService {
       default:
         return status;
     }
-  }
-
-  private _dispatchAsyncNotifications(idea: ProductIdea, newStatus: IdeaStatus, note: string): void {
-    const prefs = this.notificationPreferences();
-    if (!prefs.inAppAlerts) return;
-
-    const statusText = this.formatStatusLabel(newStatus);
-    const recipients = idea.subscribedUserEmails;
-
-    recipients.forEach(email => {
-      this._createNotification({
-        ideaId: idea.id,
-        ideaTitle: idea.title,
-        recipientEmail: email,
-        status: newStatus,
-        message: `Status changed to ${statusText}${note ? `: "${note}"` : '.'}`,
-      });
-    });
-  }
-
-  private _createNotification(params: {
-    ideaId: string;
-    ideaTitle: string;
-    recipientEmail: string;
-    status: IdeaStatus;
-    message: string;
-  }): void {
-    const newNotif: CustomerNotification = {
-      id: crypto.randomUUID(),
-      ideaId: params.ideaId,
-      ideaTitle: params.ideaTitle,
-      recipientEmail: params.recipientEmail,
-      message: params.message,
-      status: params.status,
-      createdAt: new Date().toISOString(),
-      read: false,
-    };
-
-    this._notifications.update(list => [newNotif, ...list]);
-    this._saveNotifications();
-  }
-
-  fetchNotifications(): void {
-    const email = CURRENT_CUSTOMER_EMAIL;
-    this.http.get<Array<{
-      id: string;
-      ideaId: string;
-      eventType: string;
-      title: string;
-      message: string;
-      status: string;
-      createdAt: string;
-    }>>(`${this.API_BASE}/notifications?email=${encodeURIComponent(email)}`, {
-      headers: this._getHeaders()
-    }).subscribe({
-      next: (serverNotifs) => {
-        if (!serverNotifs) return;
-        const mapped: CustomerNotification[] = serverNotifs.map(n => ({
-          id: n.id,
-          ideaId: n.ideaId,
-          ideaTitle: n.title,
-          recipientEmail: email,
-          message: n.message,
-          status: (n.status as IdeaStatus) || 'under-review',
-          createdAt: n.createdAt,
-          read: false
-        }));
-
-        this._notifications.update(local => {
-          const localMap = new Map(local.map(l => [l.id, l]));
-          for (const s of mapped) {
-            if (!localMap.has(s.id)) {
-              localMap.set(s.id, s);
-            }
-          }
-          return Array.from(localMap.values()).sort(
-            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-          );
-        });
-        this._saveNotifications();
-      },
-      error: (err) => {
-        console.warn('Could not fetch server notifications:', err);
-      }
-    });
   }
 
   private _saveIdeas(): void {

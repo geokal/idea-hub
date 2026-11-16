@@ -2,6 +2,7 @@ import { Component, signal, inject, computed, effect, viewChild, ElementRef, Hos
 import { FormsModule } from '@angular/forms';
 import { IdeaService } from '../../services/idea.service';
 import { IdeaCategory, ProductIdea } from '../../models/idea.model';
+import { validateIdeaSubmission, countCharacters } from '../../utils/validation';
 
 @Component({
   selector: 'app-idea-submit',
@@ -41,6 +42,24 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
             </button>
           </div>
 
+          <!-- Server / Validation Error Alert (Preserving draft) -->
+          @if (errorMessage()) {
+            <div class="mb-4 p-3 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 text-xs text-red-900 dark:text-red-200 flex items-start gap-2">
+              <span class="text-sm">⚠️</span>
+              <div class="flex-1">
+                <p class="font-semibold">{{ errorMessage() }}</p>
+                <p class="text-[11px] text-red-700 dark:text-red-300 mt-0.5">Your draft is preserved. Please adjust the input and submit again.</p>
+              </div>
+              <button
+                type="button"
+                (click)="errorMessage.set(null)"
+                class="text-stone-400 hover:text-stone-600 dark:hover:text-stone-200 font-bold text-sm"
+              >
+                ✕
+              </button>
+            </div>
+          }
+
           <!-- Real-Time Duplicate Detection Alert -->
           @if (potentialDuplicates().length > 0) {
             <div class="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/50 text-xs text-amber-900 dark:text-amber-200">
@@ -70,9 +89,14 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
             
             <!-- TITLE -->
             <div>
-              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
-                Title
-              </label>
+              <div class="flex items-center justify-between mb-1.5">
+                <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400">
+                  Title
+                </label>
+                <span class="text-[10px] text-stone-400 dark:text-stone-500">
+                  {{ titleLength() }}/120
+                </span>
+              </div>
               <input
                 type="text"
                 placeholder="e.g. Dark mode support"
@@ -87,14 +111,19 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
 
             <!-- DESCRIPTION -->
             <div>
-              <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
-                Description
-              </label>
+              <div class="flex items-center justify-between mb-1.5">
+                <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400">
+                  Description
+                </label>
+                <span class="text-[10px] text-stone-400 dark:text-stone-500">
+                  {{ descLength() }}/2000
+                </span>
+              </div>
               <textarea
                 placeholder="Describe your idea and the problem it solves..."
                 maxlength="2000"
                 [ngModel]="description()"
-                (ngModelChange)="description.set($event)"
+                (ngModelChange)="onDescChange($event)"
                 name="description"
                 rows="4"
                 required
@@ -111,7 +140,7 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
                 type="email"
                 placeholder="you@example.com"
                 [ngModel]="authorEmail()"
-                (ngModelChange)="authorEmail.set($event)"
+                (ngModelChange)="onEmailChange($event)"
                 name="authorEmail"
                 required
                 class="w-full bg-[#F3F2EC] dark:bg-stone-850 border border-stone-200 dark:border-stone-750 rounded-xl px-3.5 py-2.5 text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 dark:placeholder-stone-500 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] dark:focus:border-emerald-500 transition-all"
@@ -177,7 +206,11 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
                 [disabled]="!canSubmit()"
                 class="px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-[#1B4D3E] hover:bg-[#143d31] text-white disabled:opacity-40 disabled:cursor-not-allowed shadow-sm transition-all"
               >
-                Submit idea
+                @if (isSubmitting()) {
+                  <span>Submitting...</span>
+                } @else {
+                  <span>Submit idea</span>
+                }
               </button>
             </div>
 
@@ -189,8 +222,6 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
   `,
 })
 export class IdeaSubmitComponent {
-  private static readonly EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-
   readonly ideaService = inject(IdeaService);
   readonly submitDialog = viewChild<ElementRef<HTMLElement>>('submitDialog');
 
@@ -202,6 +233,11 @@ export class IdeaSubmitComponent {
   readonly authorName = signal('');
   readonly authorEmail = signal('');
   readonly potentialDuplicates = signal<ProductIdea[]>([]);
+  readonly errorMessage = signal<string | null>(null);
+  readonly isSubmitting = signal<boolean>(false);
+
+  readonly titleLength = computed(() => countCharacters(this.title()));
+  readonly descLength = computed(() => countCharacters(this.description()));
 
   readonly categories: IdeaCategory[] = [
     'Core Feature',
@@ -212,9 +248,13 @@ export class IdeaSubmitComponent {
   ];
 
   readonly canSubmit = computed(() => {
-    return this.title().trim().length >= 3 &&
-           this.description().trim().length >= 5 &&
-           IdeaSubmitComponent.EMAIL_REGEX.test(this.authorEmail().trim());
+    if (this.isSubmitting()) return false;
+    const res = validateIdeaSubmission(
+      this.title(),
+      this.description(),
+      this.authorEmail()
+    );
+    return res.valid;
   });
 
   constructor() {
@@ -273,17 +313,30 @@ export class IdeaSubmitComponent {
   }
 
   close(): void {
+    this.errorMessage.set(null);
+    this.isSubmitting.set(false);
     this.ideaService.isSubmitModalOpen.set(false);
   }
 
   onTitleChange(newTitle: string): void {
     this.title.set(newTitle);
+    this.errorMessage.set(null);
     if (newTitle.trim().length >= 3) {
       const dups = this.ideaService.detectDuplicates(newTitle);
       this.potentialDuplicates.set(dups);
     } else {
       this.potentialDuplicates.set([]);
     }
+  }
+
+  onDescChange(newDesc: string): void {
+    this.description.set(newDesc);
+    this.errorMessage.set(null);
+  }
+
+  onEmailChange(newEmail: string): void {
+    this.authorEmail.set(newEmail);
+    this.errorMessage.set(null);
   }
 
   upvoteDuplicate(dupId: string): void {
@@ -296,21 +349,44 @@ export class IdeaSubmitComponent {
 
   submit(event?: Event): void {
     if (event) event.preventDefault();
-    if (!this.canSubmit()) return;
+    this.errorMessage.set(null);
 
-    this.ideaService.submitIdea({
-      title: this.title().trim(),
-      description: this.description().trim(),
-      category: this.selectedCategory(),
-      authorName: this.authorName().trim() || 'Anonymous Customer',
-      authorEmail: this.authorEmail().trim(),
-    });
+    const validation = validateIdeaSubmission(
+      this.title(),
+      this.description(),
+      this.authorEmail()
+    );
+    if (!validation.valid) {
+      this.errorMessage.set(validation.error || 'Please correct the form fields.');
+      return;
+    }
 
-    this.title.set('');
-    this.description.set('');
-    this.authorName.set('');
-    this.authorEmail.set('');
-    this.potentialDuplicates.set([]);
-    this.close();
+    this.isSubmitting.set(true);
+
+    this.ideaService.submitIdea(
+      {
+        title: this.title().trim(),
+        description: this.description().trim(),
+        category: this.selectedCategory(),
+        authorName: this.authorName().trim() || 'Anonymous Customer',
+        authorEmail: this.authorEmail().trim(),
+      },
+      {
+        onSuccess: () => {
+          this.isSubmitting.set(false);
+          this.title.set('');
+          this.description.set('');
+          this.authorName.set('');
+          this.authorEmail.set('');
+          this.potentialDuplicates.set([]);
+          this.close();
+        },
+        onError: (err) => {
+          this.isSubmitting.set(false);
+          const serverMsg = err?.error?.error || err?.message || 'Submission rejected by server. Please check your inputs.';
+          this.errorMessage.set(serverMsg);
+        }
+      }
+    );
   }
 }

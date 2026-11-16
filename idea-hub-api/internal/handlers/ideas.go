@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"idea-hub-api/internal/database"
 
@@ -22,6 +23,24 @@ type Handler struct {
 
 func New(db *database.Service) *Handler {
 	return &Handler{db: db}
+}
+
+func (h *Handler) resolveCanonicalIdeaID(id string) string {
+	curr := id
+	for depth := 0; depth < 10; depth++ {
+		var status string
+		var mergedIntoID sql.NullString
+		err := h.db.DB.QueryRow("SELECT status, merged_into_id FROM ideas WHERE id = ?", curr).Scan(&status, &mergedIntoID)
+		if err != nil {
+			break
+		}
+		if status == "merged" && mergedIntoID.Valid && mergedIntoID.String != "" && mergedIntoID.String != curr {
+			curr = mergedIntoID.String
+		} else {
+			break
+		}
+	}
+	return curr
 }
 
 type IdeaDTO struct {
@@ -304,15 +323,21 @@ func (h *Handler) GetIdeaByID(c *fiber.Ctx) error {
 	}
 
 	detail.Subscribers = []string{}
-	subRows, err := h.db.DB.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", id)
+	canonicalID := h.resolveCanonicalIdeaID(id)
+	subRows, err := h.db.DB.Query("SELECT user_email FROM subscriptions WHERE idea_id = ? OR idea_id = ?", canonicalID, id)
 	if err == nil {
+		seen := make(map[string]bool)
 		for subRows.Next() {
 			var subEmail string
-			if err := subRows.Scan(&subEmail); err == nil {
-				if isTeam {
-					detail.Subscribers = append(detail.Subscribers, subEmail)
-				} else if callerVoterKey != "" && strings.EqualFold(subEmail, callerVoterKey) {
-					detail.Subscribers = append(detail.Subscribers, subEmail)
+			if err := subRows.Scan(&subEmail); err == nil && subEmail != "" {
+				normEmail := strings.ToLower(strings.TrimSpace(subEmail))
+				if !seen[normEmail] {
+					seen[normEmail] = true
+					if isTeam {
+						detail.Subscribers = append(detail.Subscribers, subEmail)
+					} else if callerVoterKey != "" && strings.EqualFold(normEmail, callerVoterKey) {
+						detail.Subscribers = append(detail.Subscribers, subEmail)
+					}
 				}
 			}
 		}
@@ -339,11 +364,11 @@ func (h *Handler) CreateIdea(c *fiber.Ctx) error {
 	}
 
 	title := strings.TrimSpace(req.Title)
-	if title == "" || len(title) > 120 {
+	if title == "" || utf8.RuneCountInString(title) > 120 {
 		return c.Status(400).JSON(fiber.Map{"error": "Title required (max 120 characters)"})
 	}
 	desc := strings.TrimSpace(req.Description)
-	if desc == "" || len(desc) > 2000 {
+	if desc == "" || utf8.RuneCountInString(desc) > 2000 {
 		return c.Status(400).JSON(fiber.Map{"error": "Description required (max 2000 characters)"})
 	}
 
@@ -351,7 +376,7 @@ func (h *Handler) CreateIdea(c *fiber.Ctx) error {
 	if authorName == "" {
 		authorName = "Customer"
 	}
-	authorEmail := strings.TrimSpace(req.AuthorEmail)
+	authorEmail := strings.ToLower(strings.TrimSpace(req.AuthorEmail))
 	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$`)
 	if authorEmail == "" || !emailRegex.MatchString(authorEmail) {
 		return c.Status(400).JSON(fiber.Map{"error": "A valid author email address is required"})
@@ -600,14 +625,14 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 
 	recipients := make(map[string]bool)
 	if authorEmail != "" {
-		recipients[authorEmail] = true
+		recipients[strings.ToLower(strings.TrimSpace(authorEmail))] = true
 	}
 	subRows, err := tx.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", id)
 	if err == nil {
 		for subRows.Next() {
 			var subEmail string
 			if err := subRows.Scan(&subEmail); err == nil && subEmail != "" {
-				recipients[subEmail] = true
+				recipients[strings.ToLower(strings.TrimSpace(subEmail))] = true
 			}
 		}
 		subRows.Close()
@@ -716,14 +741,14 @@ func (h *Handler) CreateComment(c *fiber.Ctx) error {
 
 		recipients := make(map[string]bool)
 		if ideaAuthorEmail != "" {
-			recipients[ideaAuthorEmail] = true
+			recipients[strings.ToLower(strings.TrimSpace(ideaAuthorEmail))] = true
 		}
 		subRows, err := h.db.DB.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", id)
 		if err == nil {
 			for subRows.Next() {
 				var subEmail string
 				if err := subRows.Scan(&subEmail); err == nil && subEmail != "" {
-					recipients[subEmail] = true
+					recipients[strings.ToLower(strings.TrimSpace(subEmail))] = true
 				}
 			}
 			subRows.Close() // Explicitly close immediately to free the single database connection!
@@ -990,8 +1015,11 @@ func (h *Handler) ToggleSubscription(c *fiber.Ctx) error {
 		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
 	}
 
+	// Resolve canonical idea ID if merged
+	canonicalID := h.resolveCanonicalIdeaID(id)
+
 	var existingID string
-	err := h.db.DB.QueryRow("SELECT id FROM subscriptions WHERE idea_id = ? AND user_email = ?", id, email).Scan(&existingID)
+	err := h.db.DB.QueryRow("SELECT id FROM subscriptions WHERE (idea_id = ? OR idea_id = ?) AND LOWER(user_email) = ? LIMIT 1", canonicalID, id, email).Scan(&existingID)
 	alreadySubscribed := err == nil
 
 	action := strings.ToLower(strings.TrimSpace(req.Action))
@@ -1000,14 +1028,16 @@ func (h *Handler) ToggleSubscription(c *fiber.Ctx) error {
 	}
 
 	if (action == "unsubscribe" || (action == "toggle" && alreadySubscribed)) && alreadySubscribed {
-		_, _ = h.db.DB.Exec("DELETE FROM subscriptions WHERE id = ?", existingID)
+		// Clean up subscriptions on both source and canonical destination
+		_, _ = h.db.DB.Exec("DELETE FROM subscriptions WHERE (idea_id = ? OR idea_id = ?) AND LOWER(user_email) = ?", canonicalID, id, email)
 		return c.JSON(fiber.Map{"subscribed": false, "message": "Unsubscribed successfully"})
 	}
 
 	if (action == "subscribe" || (action == "toggle" && !alreadySubscribed)) && !alreadySubscribed {
 		subID := uuid.New().String()
 		now := time.Now().UTC().Format(time.RFC3339)
-		_, err = h.db.DB.Exec("INSERT INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, id, email, now)
+		// Record subscription against the canonical idea
+		_, err = h.db.DB.Exec("INSERT OR IGNORE INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, canonicalID, email, now)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": "Failed to record subscription: " + err.Error()})
 		}

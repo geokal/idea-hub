@@ -1,5 +1,5 @@
 import { Component, inject, signal } from '@angular/core';
-import { DatePipe } from '@angular/common';
+import { DatePipe, TitleCasePipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ThemeService } from '../../services/theme.service';
 import { IdeaService } from '../../services/idea.service';
@@ -7,8 +7,34 @@ import { UserRole } from '../../models/idea.model';
 
 @Component({
   selector: 'app-header',
-  imports: [DatePipe, FormsModule],
+  imports: [DatePipe, TitleCasePipe, FormsModule],
   template: `
+    <!-- Auth Error Alert Banner -->
+    @if (ideaService.authError()) {
+      <div class="bg-red-50 dark:bg-red-950/60 border-b border-red-200 dark:border-red-900/60 px-4 py-2 text-xs text-red-800 dark:text-red-200 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span>🔒</span>
+          <span>{{ ideaService.authError() }}</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <button
+            type="button"
+            (click)="openKeyModal()"
+            class="font-semibold text-red-900 dark:text-red-100 underline hover:no-underline cursor-pointer"
+          >
+            Enter Key
+          </button>
+          <button
+            type="button"
+            (click)="ideaService.authError.set(null)"
+            class="text-red-500 hover:text-red-800 dark:hover:text-red-200 font-bold cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+    }
+
     <header class="py-4 border-b border-stone-200/60 dark:border-stone-800">
       <div class="max-w-4xl mx-auto px-4 flex items-center justify-between gap-4">
         
@@ -20,7 +46,9 @@ import { UserRole } from '../../models/idea.model';
 
           <!-- Active Role Indicator Badge -->
           <span
-            class="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border hidden sm:inline-block"
+            class="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border hidden sm:inline-block cursor-pointer"
+            (click)="onRoleBadgeClick()"
+            [title]="ideaService.currentRole() !== 'customer' ? 'Click to change API Key' : ''"
             [class.bg-blue-50]="ideaService.currentRole() === 'customer'"
             [class.text-blue-700]="ideaService.currentRole() === 'customer'"
             [class.border-blue-200]="ideaService.currentRole() === 'customer'"
@@ -43,6 +71,9 @@ import { UserRole } from '../../models/idea.model';
             [class.dark:border-purple-900]="ideaService.currentRole() === 'admin'"
           >
             {{ roleLabel() }}
+            @if (ideaService.currentRole() !== 'customer' && ideaService.adminApiKey()) {
+              <span class="ml-1 text-[9px] opacity-75">🔑</span>
+            }
           </span>
         </div>
 
@@ -53,8 +84,8 @@ import { UserRole } from '../../models/idea.model';
           <div class="flex bg-stone-200/60 dark:bg-stone-850 p-1 rounded-xl border border-stone-200 dark:border-stone-800 text-xs font-medium">
             <button
               type="button"
-              (click)="ideaService.setRole('customer')"
-              class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1"
+              (click)="selectRole('customer')"
+              class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 cursor-pointer"
               [class.bg-white]="ideaService.currentRole() === 'customer'"
               [class.dark:bg-stone-700]="ideaService.currentRole() === 'customer'"
               [class.text-stone-900]="ideaService.currentRole() === 'customer'"
@@ -67,29 +98,29 @@ import { UserRole } from '../../models/idea.model';
             </button>
             <button
               type="button"
-              (click)="ideaService.setRole('team')"
-              class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1"
+              (click)="selectRole('team')"
+              class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 cursor-pointer"
               [class.bg-white]="ideaService.currentRole() === 'team'"
               [class.dark:bg-stone-700]="ideaService.currentRole() === 'team'"
               [class.text-stone-900]="ideaService.currentRole() === 'team'"
               [class.dark:text-white]="ideaService.currentRole() === 'team'"
               [class.shadow-xs]="ideaService.currentRole() === 'team'"
               [class.text-stone-500]="ideaService.currentRole() !== 'team'"
-              title="Team: Triage & internal notes"
+              title="Team: Triage & internal notes (Requires key)"
             >
               <span>Team</span>
             </button>
             <button
               type="button"
-              (click)="ideaService.setRole('admin')"
-              class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1"
+              (click)="selectRole('admin')"
+              class="px-2.5 py-1 rounded-lg transition-all flex items-center gap-1 cursor-pointer"
               [class.bg-white]="ideaService.currentRole() === 'admin'"
               [class.dark:bg-stone-700]="ideaService.currentRole() === 'admin'"
               [class.text-stone-900]="ideaService.currentRole() === 'admin'"
               [class.dark:text-white]="ideaService.currentRole() === 'admin'"
               [class.shadow-xs]="ideaService.currentRole() === 'admin'"
               [class.text-stone-500]="ideaService.currentRole() !== 'admin'"
-              title="Admin: Full settings"
+              title="Admin: Full settings & export (Requires key)"
             >
               <span>Admin</span>
             </button>
@@ -183,6 +214,77 @@ import { UserRole } from '../../models/idea.model';
 
       </div>
     </header>
+
+    <!-- Team / Admin API Key Authentication Modal -->
+    @if (showKeyModal()) {
+      <div
+        class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-stone-900/50 backdrop-blur-xs transition-opacity animate-fade-in"
+        (click)="cancelKeyModal()"
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="key-modal-title"
+          class="relative w-full max-w-md bg-[#FAF9F5] dark:bg-[#1A1A18] rounded-2xl p-6 shadow-2xl border border-stone-200/90 dark:border-stone-800 text-stone-800 dark:text-stone-100 animate-scale-up"
+          (click)="$event.stopPropagation()"
+        >
+          <div class="flex items-center justify-between pb-3 border-b border-stone-200 dark:border-stone-800 mb-4">
+            <h3 id="key-modal-title" class="text-lg font-serif font-bold text-stone-900 dark:text-stone-100 flex items-center gap-2">
+              <span>🔐</span>
+              <span>Authentication Required</span>
+            </h3>
+            <button
+              type="button"
+              (click)="cancelKeyModal()"
+              class="text-stone-400 hover:text-stone-600 dark:hover:text-stone-200 font-bold"
+            >
+              ✕
+            </button>
+          </div>
+
+          <p class="text-xs text-stone-600 dark:text-stone-400 mb-4 leading-relaxed">
+            Accessing the <strong>{{ pendingRole() | titlecase }}</strong> perspective requires a valid API key configured on the server (<code>ADMIN_API_KEY</code>).
+          </p>
+
+          @if (keyInputError()) {
+            <div class="mb-3 p-2.5 rounded-lg bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 text-xs text-red-800 dark:text-red-300">
+              {{ keyInputError() }}
+            </div>
+          }
+
+          <div class="mb-4">
+            <label class="block text-[11px] font-bold uppercase tracking-wider text-stone-500 dark:text-stone-400 mb-1.5">
+              Admin / Team API Key
+            </label>
+            <input
+              type="password"
+              placeholder="Enter key (configured in server environment)"
+              [ngModel]="enteredKey()"
+              (ngModelChange)="enteredKey.set($event)"
+              (keydown.enter)="confirmKey()"
+              class="w-full bg-[#F3F2EC] dark:bg-stone-850 border border-stone-200 dark:border-stone-750 rounded-xl px-3.5 py-2.5 text-sm text-stone-900 dark:text-stone-100 placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-[#1B4D3E]/20 focus:border-[#1B4D3E] transition-all"
+            />
+          </div>
+
+          <div class="flex items-center justify-end gap-2.5 pt-3 border-t border-stone-200 dark:border-stone-800">
+            <button
+              type="button"
+              (click)="cancelKeyModal()"
+              class="px-4 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-stone-800 border border-stone-200 dark:border-stone-700 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-750 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              (click)="confirmKey()"
+              class="px-5 py-2 rounded-xl text-xs font-semibold bg-[#1B4D3E] hover:bg-[#143d31] text-white shadow-sm transition-all"
+            >
+              Authenticate & Switch
+            </button>
+          </div>
+        </div>
+      </div>
+    }
   `,
 })
 export class HeaderComponent {
@@ -190,6 +292,10 @@ export class HeaderComponent {
   readonly ideaService = inject(IdeaService);
 
   readonly showNotifs = signal(false);
+  readonly showKeyModal = signal(false);
+  readonly pendingRole = signal<UserRole>('team');
+  readonly enteredKey = signal('');
+  readonly keyInputError = signal<string | null>(null);
 
   roleLabel(): string {
     switch (this.ideaService.currentRole()) {
@@ -197,5 +303,53 @@ export class HeaderComponent {
       case 'admin': return 'Admin';
       default: return 'Customer';
     }
+  }
+
+  selectRole(targetRole: UserRole): void {
+    if (targetRole === 'customer') {
+      this.ideaService.setRole('customer');
+      return;
+    }
+
+    if (!this.ideaService.adminApiKey()) {
+      this.pendingRole.set(targetRole);
+      this.enteredKey.set('');
+      this.keyInputError.set(null);
+      this.showKeyModal.set(true);
+      return;
+    }
+
+    this.ideaService.setRole(targetRole);
+  }
+
+  onRoleBadgeClick(): void {
+    if (this.ideaService.currentRole() !== 'customer') {
+      this.openKeyModal();
+    }
+  }
+
+  openKeyModal(): void {
+    const role = this.ideaService.currentRole();
+    this.pendingRole.set(role === 'customer' ? 'team' : role);
+    this.enteredKey.set(this.ideaService.adminApiKey());
+    this.keyInputError.set(null);
+    this.showKeyModal.set(true);
+  }
+
+  confirmKey(): void {
+    const key = this.enteredKey().trim();
+    if (!key) {
+      this.keyInputError.set('API key cannot be empty.');
+      return;
+    }
+    this.ideaService.setAdminApiKey(key);
+    this.ideaService.setRole(this.pendingRole());
+    this.showKeyModal.set(false);
+  }
+
+  cancelKeyModal(): void {
+    this.showKeyModal.set(false);
+    this.enteredKey.set('');
+    this.keyInputError.set(null);
   }
 }
