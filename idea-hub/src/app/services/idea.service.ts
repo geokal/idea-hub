@@ -1,4 +1,5 @@
-import { Injectable, signal, computed } from '@angular/core';
+import { Injectable, signal, computed, inject, effect } from '@angular/core';
+import { HttpClient, HttpHeaders } from '@angular/common/http';
 import {
   ProductIdea,
   IdeaStatus,
@@ -19,8 +20,62 @@ const STORAGE_PREFS_KEY = 'ideahub_prefs_data_v3';
 export const CURRENT_CUSTOMER_EMAIL = 'customer@example.com';
 export const CURRENT_CUSTOMER_NAME = 'Sarah Customer';
 
+interface IdeaBackendDTO {
+  id: string;
+  title: string;
+  description: string;
+  category: IdeaCategory;
+  status: IdeaStatus;
+  authorName: string;
+  authorEmail?: string;
+  upvotes: number;
+  mergedIntoId?: string;
+  mergedIntoTitle?: string;
+  createdAt: string;
+  updatedAt: string;
+  commentsCount: number;
+  internalCount?: number;
+}
+
+interface IdeaDetailBackendDTO extends IdeaBackendDTO {
+  comments: Array<{
+    id: string;
+    ideaId: string;
+    authorName: string;
+    authorEmail?: string;
+    isTeamMember: boolean;
+    isInternal: boolean;
+    content: string;
+    createdAt: string;
+  }>;
+  internalNotes?: Array<{
+    id: string;
+    ideaId: string;
+    authorName: string;
+    authorEmail?: string;
+    isTeamMember: boolean;
+    isInternal: boolean;
+    content: string;
+    createdAt: string;
+  }>;
+  statusHistory: Array<{
+    id: string;
+    ideaId: string;
+    previousStatus: IdeaStatus;
+    newStatus: IdeaStatus;
+    changedBy: string;
+    note?: string;
+    timestamp: string;
+  }>;
+}
+
 @Injectable({ providedIn: 'root' })
 export class IdeaService {
+  private readonly http = inject(HttpClient);
+  private readonly API_BASE = 'http://localhost:8080/api';
+  private readonly _pendingSubmissionIds = new Set<string>();
+  private readonly _ideaDetailSeq = new Map<string, number>();
+
   // 1. Perspective / Role
   readonly currentRole = signal<UserRole>(this._loadRole());
 
@@ -64,6 +119,127 @@ export class IdeaService {
   readonly completedCount = computed(() => this._ideas().filter(i => i.status === 'completed').length);
   readonly declinedCount = computed(() => this._ideas().filter(i => i.status === 'declined').length);
   readonly mergedCount = computed(() => this._ideas().filter(i => i.status === 'merged').length);
+
+  constructor() {
+    // Initial fetch from Go API backend
+    this.refreshIdeas();
+
+    // Auto-fetch full detail when an idea is opened
+    effect(() => {
+      const id = this.selectedIdeaId();
+      if (id) {
+        this.fetchIdeaDetail(id);
+      }
+    });
+  }
+
+  private _getHeaders(): HttpHeaders {
+    return new HttpHeaders({
+      'X-User-Role': this.currentRole(),
+      'Content-Type': 'application/json'
+    });
+  }
+
+  // Refresh ideas list from Go backend
+  refreshIdeas(): void {
+    this.http.get<IdeaBackendDTO[]>(`${this.API_BASE}/ideas`, { headers: this._getHeaders() })
+      .subscribe({
+        next: (dtos) => {
+          if (!dtos) return;
+          const existingMap = new Map(this._ideas().map(i => [i.id, i]));
+          const backendList: ProductIdea[] = dtos.map(dto => {
+            const prev = existingMap.get(dto.id);
+            return {
+              id: dto.id,
+              title: dto.title,
+              description: dto.description,
+              category: dto.category,
+              status: dto.status,
+              authorName: dto.authorName,
+              authorEmail: dto.authorEmail || prev?.authorEmail || (dto.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''),
+              upvotes: dto.upvotes,
+              upvotedByUser: prev ? prev.upvotedByUser : false,
+              subscribedUserEmails: prev?.subscribedUserEmails || [CURRENT_CUSTOMER_EMAIL],
+              createdAt: dto.createdAt,
+              comments: prev?.comments || [],
+              commentsCount: dto.commentsCount,
+              internalNotes: prev?.internalNotes || [],
+              statusHistory: prev?.statusHistory || [],
+              mergedIntoId: dto.mergedIntoId,
+              mergedIntoTitle: dto.mergedIntoTitle
+            };
+          });
+
+          // Preserve any locally accepted submissions that have not yet synced
+          const pendingIdeas = this._ideas().filter(i => this._pendingSubmissionIds.has(i.id));
+          this._ideas.set([...pendingIdeas, ...backendList]);
+          this._saveIdeas();
+        },
+        error: (err) => {
+          console.warn('IdeaHub Go API offline or unreachable, using local storage state:', err);
+        }
+      });
+  }
+
+  // Fetch full detail with comments, internal notes, and audit history
+  fetchIdeaDetail(id: string): void {
+    const currentSeq = (this._ideaDetailSeq.get(id) || 0) + 1;
+    this._ideaDetailSeq.set(id, currentSeq);
+
+    this.http.get<IdeaDetailBackendDTO>(`${this.API_BASE}/ideas/${id}`, { headers: this._getHeaders() })
+      .subscribe({
+        next: (detail) => {
+          if (!detail) return;
+          // Reject stale response that precedes a newer edit
+          if (this._ideaDetailSeq.get(id) !== currentSeq) return;
+
+          this._ideas.update(list =>
+            list.map(idea => {
+              if (idea.id !== id) return idea;
+              return {
+                ...idea,
+                title: detail.title,
+                description: detail.description,
+                category: detail.category,
+                status: detail.status,
+                authorName: detail.authorName,
+                authorEmail: detail.authorEmail || idea.authorEmail,
+                upvotes: detail.upvotes,
+                commentsCount: detail.comments?.length ?? detail.commentsCount,
+                mergedIntoId: detail.mergedIntoId,
+                mergedIntoTitle: detail.mergedIntoTitle,
+                comments: (detail.comments || []).map(c => ({
+                  id: c.id,
+                  authorName: c.authorName,
+                  authorEmail: c.authorEmail || '',
+                  isTeamMember: c.isTeamMember,
+                  content: c.content,
+                  createdAt: c.createdAt
+                })),
+                internalNotes: (detail.internalNotes || []).map(n => ({
+                  id: n.id,
+                  authorName: n.authorName,
+                  authorEmail: n.authorEmail || '',
+                  content: n.content,
+                  createdAt: n.createdAt
+                })),
+                statusHistory: (detail.statusHistory || []).map(h => ({
+                  id: h.id,
+                  previousStatus: h.previousStatus,
+                  newStatus: h.newStatus,
+                  changedBy: h.changedBy,
+                  note: h.note || '',
+                  timestamp: h.timestamp
+                }))
+              };
+            })
+          );
+        },
+        error: (err) => {
+          console.warn(`Could not fetch detail from API for idea ${id}:`, err);
+        }
+      });
+  }
 
   detectDuplicates(query: string): ProductIdea[] {
     const q = query.trim().toLowerCase();
@@ -113,8 +289,11 @@ export class IdeaService {
           return b.upvotes - a.upvotes;
         case 'date-desc':
           return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-        case 'comments-desc':
-          return b.comments.length - a.comments.length;
+        case 'comments-desc': {
+          const countA = a.commentsCount ?? a.comments.length;
+          const countB = b.commentsCount ?? b.comments.length;
+          return countB - countA;
+        }
         default:
           return 0;
       }
@@ -127,6 +306,11 @@ export class IdeaService {
     try {
       localStorage.setItem(STORAGE_ROLE_KEY, role);
     } catch {}
+    this.refreshIdeas();
+    const activeId = this.selectedIdeaId();
+    if (activeId) {
+      this.fetchIdeaDetail(activeId);
+    }
   }
 
   // Duplicate detection helper for input title
@@ -142,9 +326,10 @@ export class IdeaService {
   submitIdea(params: { title: string; description: string; category: IdeaCategory; authorName: string; authorEmail: string }): ProductIdea {
     const authorEmail = params.authorEmail.trim() || CURRENT_CUSTOMER_EMAIL;
     const authorName = params.authorName.trim() || CURRENT_CUSTOMER_NAME;
+    const tempId = crypto.randomUUID();
 
     const newIdea: ProductIdea = {
-      id: crypto.randomUUID(),
+      id: tempId,
       title: params.title.trim(),
       description: params.description.trim(),
       category: params.category,
@@ -156,6 +341,7 @@ export class IdeaService {
       subscribedUserEmails: [authorEmail],
       createdAt: new Date().toISOString(),
       comments: [],
+      commentsCount: 0,
       internalNotes: [],
       statusHistory: [
         {
@@ -169,13 +355,49 @@ export class IdeaService {
       ],
     };
 
+    // Track pending submission durably
+    this._pendingSubmissionIds.add(tempId);
+
+    // Optimistic UI update
     this._ideas.update(list => [newIdea, ...list]);
     this._saveIdeas();
+
+    // Call Go Fiber API backend
+    this.http.post<{ id: string; message: string }>(
+      `${this.API_BASE}/ideas`,
+      {
+        title: newIdea.title,
+        description: newIdea.description,
+        category: newIdea.category,
+        authorName: newIdea.authorName,
+        authorEmail: newIdea.authorEmail
+      },
+      { headers: this._getHeaders() }
+    ).subscribe({
+      next: (res) => {
+        this._pendingSubmissionIds.delete(tempId);
+        if (res && res.id) {
+          // Remap selection if user opened the item while creation was in flight
+          if (this.selectedIdeaId() === tempId) {
+            this.selectedIdeaId.set(res.id);
+          }
+          this._ideas.update(list =>
+            list.map(i => i.id === tempId ? { ...i, id: res.id } : i)
+          );
+          this._saveIdeas();
+        }
+      },
+      error: (err) => {
+        console.warn('Submit idea API sync error, queued locally:', err);
+      }
+    });
+
     return newIdea;
   }
 
   // Toggle Upvote
   toggleUpvote(ideaId: string): void {
+    let nextUpvotes = 0;
     this._ideas.update(list =>
       list.map(idea => {
         if (idea.id !== ideaId) return idea;
@@ -183,16 +405,36 @@ export class IdeaService {
         const newSubs = upvoted
           ? Array.from(new Set([...idea.subscribedUserEmails, CURRENT_CUSTOMER_EMAIL]))
           : idea.subscribedUserEmails;
+        nextUpvotes = upvoted ? idea.upvotes + 1 : Math.max(0, idea.upvotes - 1);
 
         return {
           ...idea,
           upvotedByUser: upvoted,
-          upvotes: upvoted ? idea.upvotes + 1 : Math.max(0, idea.upvotes - 1),
+          upvotes: nextUpvotes,
           subscribedUserEmails: newSubs,
         };
       })
     );
     this._saveIdeas();
+
+    // Sync to Go Fiber API
+    this.http.post<{ id: string; upvotes: number }>(
+      `${this.API_BASE}/ideas/${ideaId}/upvote`,
+      {},
+      { headers: this._getHeaders() }
+    ).subscribe({
+      next: (res) => {
+        if (res && typeof res.upvotes === 'number') {
+          this._ideas.update(list =>
+            list.map(i => i.id === ideaId ? { ...i, upvotes: res.upvotes } : i)
+          );
+          this._saveIdeas();
+        }
+      },
+      error: (err) => {
+        console.warn('Upvote API sync error:', err);
+      }
+    });
   }
 
   // Toggle Subscription
@@ -223,13 +465,18 @@ export class IdeaService {
     const trimmed = content.trim();
     if (!trimmed) return;
 
+    // Invalidate earlier in-flight details
+    this._ideaDetailSeq.set(ideaId, (this._ideaDetailSeq.get(ideaId) || 0) + 1);
+
     const role = this.currentRole();
     const isTeam = role === 'team' || role === 'admin';
+    const authorName = isTeam ? 'Product Team' : CURRENT_CUSTOMER_NAME;
+    const authorEmail = isTeam ? 'team@company.internal' : CURRENT_CUSTOMER_EMAIL;
 
     const comment: Comment = {
       id: crypto.randomUUID(),
-      authorName: isTeam ? 'Product Team' : CURRENT_CUSTOMER_NAME,
-      authorEmail: isTeam ? 'team@company.internal' : CURRENT_CUSTOMER_EMAIL,
+      authorName,
+      authorEmail,
       isTeamMember: isTeam,
       content: trimmed,
       createdAt: new Date().toISOString(),
@@ -238,9 +485,11 @@ export class IdeaService {
     this._ideas.update(list =>
       list.map(idea => {
         if (idea.id !== ideaId) return idea;
+        const updatedComments = [...idea.comments, comment];
         return {
           ...idea,
-          comments: [...idea.comments, comment],
+          comments: updatedComments,
+          commentsCount: updatedComments.length,
         };
       })
     );
@@ -259,6 +508,23 @@ export class IdeaService {
         });
       }
     }
+
+    // Sync to Go Fiber API
+    this.http.post<{ id: string }>(
+      `${this.API_BASE}/ideas/${ideaId}/comments`,
+      {
+        authorName,
+        authorEmail,
+        content: trimmed,
+        isInternal: false
+      },
+      { headers: this._getHeaders() }
+    ).subscribe({
+      next: () => {
+        this.fetchIdeaDetail(ideaId);
+      },
+      error: (err) => console.warn('Comment API sync error:', err)
+    });
   }
 
   // Add Internal Note (Team & Admin only)
@@ -267,10 +533,16 @@ export class IdeaService {
     const trimmed = content.trim();
     if (!trimmed) return;
 
+    // Invalidate earlier in-flight details
+    this._ideaDetailSeq.set(ideaId, (this._ideaDetailSeq.get(ideaId) || 0) + 1);
+
+    const authorName = this.isAdmin() ? 'David Park (Admin)' : 'Mike Chen (Team)';
+    const authorEmail = 'team@internal.corp';
+
     const note: InternalTeamNote = {
       id: crypto.randomUUID(),
-      authorName: this.isAdmin() ? 'David Park (Admin)' : 'Mike Chen (Team)',
-      authorEmail: 'team@internal.corp',
+      authorName,
+      authorEmail,
       content: trimmed,
       createdAt: new Date().toISOString(),
     };
@@ -285,11 +557,34 @@ export class IdeaService {
       })
     );
     this._saveIdeas();
+
+    // Sync to Go Fiber API
+    this.http.post<{ id: string }>(
+      `${this.API_BASE}/ideas/${ideaId}/comments`,
+      {
+        authorName,
+        authorEmail,
+        content: trimmed,
+        isInternal: true
+      },
+      { headers: this._getHeaders() }
+    ).subscribe({
+      next: () => {
+        this.fetchIdeaDetail(ideaId);
+      },
+      error: (err) => console.warn('Internal note API sync error:', err)
+    });
   }
 
   // Update Status & Async Notification with Public Note
   updateStatus(ideaId: string, newStatus: IdeaStatus, publicNote: string): void {
     if (!this.isTeamMember()) return;
+
+    // Invalidate earlier in-flight details
+    this._ideaDetailSeq.set(ideaId, (this._ideaDetailSeq.get(ideaId) || 0) + 1);
+
+    const changedBy = this.isAdmin() ? 'David Park (Admin)' : 'Sarah Johnson (Team)';
+    const noteText = publicNote.trim() || `Status updated to ${this.formatStatusLabel(newStatus)}.`;
 
     let targetIdea: ProductIdea | undefined;
 
@@ -301,8 +596,8 @@ export class IdeaService {
           id: crypto.randomUUID(),
           previousStatus: idea.status,
           newStatus,
-          changedBy: this.isAdmin() ? 'David Park (Admin)' : 'Sarah Johnson (Team)',
-          note: publicNote.trim() || `Status updated to ${this.formatStatusLabel(newStatus)}.`,
+          changedBy,
+          note: noteText,
           timestamp: new Date().toISOString(),
         };
 
@@ -320,6 +615,22 @@ export class IdeaService {
     if (targetIdea) {
       this._dispatchAsyncNotifications(targetIdea, newStatus, publicNote.trim());
     }
+
+    // Sync to Go Fiber API
+    this.http.post<{ id: string; newStatus: string }>(
+      `${this.API_BASE}/ideas/${ideaId}/status`,
+      {
+        status: newStatus,
+        note: noteText,
+        changedBy
+      },
+      { headers: this._getHeaders() }
+    ).subscribe({
+      next: () => {
+        this.fetchIdeaDetail(ideaId);
+      },
+      error: (err) => console.warn('Status update API sync error:', err)
+    });
   }
 
   // Merge Duplicate Feedback
@@ -387,6 +698,23 @@ export class IdeaService {
       status: 'merged',
       message: `Your feedback "${source.title}" was merged into "${target.title}". All upvotes have been consolidated into the canonical idea.`,
     });
+
+    // Sync to Go Fiber API
+    this.http.post(
+      `${this.API_BASE}/ideas/merge`,
+      {
+        sourceIdeaId,
+        targetIdeaId,
+        note: noteText
+      },
+      { headers: this._getHeaders() }
+    ).subscribe({
+      next: () => {
+        this.refreshIdeas();
+        this.fetchIdeaDetail(target.id);
+      },
+      error: (err) => console.warn('Merge ideas API sync error:', err)
+    });
   }
 
   // Delete Idea (Admin only)
@@ -397,6 +725,14 @@ export class IdeaService {
       this.selectedIdeaId.set(null);
     }
     this._saveIdeas();
+
+    // Sync to Go Fiber API
+    this.http.delete(
+      `${this.API_BASE}/ideas/${ideaId}`,
+      { headers: this._getHeaders() }
+    ).subscribe({
+      error: (err) => console.warn('Delete idea API sync error:', err)
+    });
   }
 
   // Export to CSV (Section 8 of SPEC.MD)
@@ -419,65 +755,79 @@ export class IdeaService {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
-    link.setAttribute('download', `feedback_dashboard_export_${new Date().toISOString().slice(0, 10)}.csv`);
+    link.setAttribute('download', `ideahub-feedback-export-${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
-  markNotificationRead(notificationId: string): void {
-    this._notifications.update(notifs =>
-      notifs.map(n => (n.id === notificationId ? { ...n, read: true } : n))
-    );
+  // Notifications logic
+  markNotificationRead(id: string): void {
+    this._notifications.update(list => list.map(n => (n.id === id ? { ...n, read: true } : n)));
     this._saveNotifications();
   }
 
   markAllNotificationsRead(): void {
-    this._notifications.update(notifs => notifs.map(n => ({ ...n, read: true })));
+    this._notifications.update(list => list.map(n => ({ ...n, read: true })));
     this._saveNotifications();
   }
 
   togglePreference(key: keyof NotificationPreferences): void {
-    this.notificationPreferences.update(p => {
-      const updated = { ...p, [key]: !p[key] };
+    this.notificationPreferences.update(prefs => {
+      const next = { ...prefs, [key]: !prefs[key] };
       try {
-        localStorage.setItem(STORAGE_PREFS_KEY, JSON.stringify(updated));
+        localStorage.setItem(STORAGE_PREFS_KEY, JSON.stringify(next));
       } catch {}
-      return updated;
+      return next;
     });
   }
 
   formatStatusLabel(status: IdeaStatus): string {
     switch (status) {
-      case 'under-review': return 'Under Review';
-      case 'planned': return 'Planned';
-      case 'in-progress': return 'In Progress';
-      case 'completed': return 'Completed';
-      case 'declined': return 'Declined';
-      case 'merged': return 'Merged';
+      case 'under-review':
+        return 'Under Review';
+      case 'planned':
+        return 'Planned';
+      case 'in-progress':
+        return 'In Progress';
+      case 'completed':
+        return 'Completed';
+      case 'declined':
+        return 'Declined';
+      case 'merged':
+        return 'Merged';
+      default:
+        return status;
     }
   }
 
-  // Async non-blocking notification dispatch
-  private _dispatchAsyncNotifications(idea: ProductIdea, status: IdeaStatus, publicNote: string): void {
-    setTimeout(() => {
-      if (!this.notificationPreferences().inAppAlerts) return;
+  private _dispatchAsyncNotifications(idea: ProductIdea, newStatus: IdeaStatus, note: string): void {
+    const prefs = this.notificationPreferences();
+    if (!prefs.inAppAlerts) return;
 
-      const noteText = publicNote || `Status updated to ${this.formatStatusLabel(status)}.`;
-      idea.subscribedUserEmails.forEach(email => {
-        this._createNotification({
-          ideaId: idea.id,
-          ideaTitle: idea.title,
-          recipientEmail: email,
-          status,
-          message: `Update on "${idea.title}": ${noteText}`,
-        });
+    const statusText = this.formatStatusLabel(newStatus);
+    const recipients = idea.subscribedUserEmails;
+
+    recipients.forEach(email => {
+      this._createNotification({
+        ideaId: idea.id,
+        ideaTitle: idea.title,
+        recipientEmail: email,
+        status: newStatus,
+        message: `Status changed to ${statusText}${note ? `: "${note}"` : '.'}`,
       });
-    }, 150);
+    });
   }
 
-  private _createNotification(params: { ideaId: string; ideaTitle: string; recipientEmail: string; status: IdeaStatus; message: string }): void {
-    const notif: CustomerNotification = {
+  private _createNotification(params: {
+    ideaId: string;
+    ideaTitle: string;
+    recipientEmail: string;
+    status: IdeaStatus;
+    message: string;
+  }): void {
+    const newNotif: CustomerNotification = {
       id: crypto.randomUUID(),
       ideaId: params.ideaId,
       ideaTitle: params.ideaTitle,
@@ -487,7 +837,8 @@ export class IdeaService {
       createdAt: new Date().toISOString(),
       read: false,
     };
-    this._notifications.update(list => [notif, ...list]);
+
+    this._notifications.update(list => [newNotif, ...list]);
     this._saveNotifications();
   }
 

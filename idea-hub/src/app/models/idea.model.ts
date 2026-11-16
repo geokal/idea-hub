@@ -60,6 +60,7 @@ export interface ProductIdea {
   subscribedUserEmails: string[];
   createdAt: string;
   comments: Comment[];
+  commentsCount?: number;
   internalNotes: InternalTeamNote[];
   statusHistory: StatusHistory[];
   mergedIntoId?: string;

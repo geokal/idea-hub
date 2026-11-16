@@ -1,22 +1,21 @@
 # GEMINI.md — Workspace Guidelines & Architecture
 
-Welcome to the `todoapp` monorepo workspace. This document outlines project architecture, coding standards, and best practices for developing, reviewing, and navigating code across this repository.
+Welcome to the **IdeaHub** (Product Idea & Feedback System) workspace. This document outlines project architecture, coding standards, and best practices for developing, reviewing, and navigating code across this repository.
 
 ---
 
 ## 1. Workspace Layout
 
-The repository contains two primary product applications and one shared API service:
+The workspace is organized into a modern Angular client and a lightweight Go REST API:
 
 ```
-C:\Users\bigbu\source\repos\todoapp\
 ├── idea-hub/               # Product Idea & Feedback System (Angular 22 + Tailwind CSS v4)
 │   ├── src/app/
 │   │   ├── components/     # Standalone components (header, idea-card, idea-submit, idea-toolbar, idea-detail)
-│   │   ├── models/         # TypeScript interfaces (Idea, Comment, Status, UserRole, ActivityLog)
+│   │   ├── models/         # TypeScript interfaces (ProductIdea, Comment, InternalTeamNote, UserRole)
 │   │   └── services/       # Reactive services using Angular Signals & HttpClient (idea.service, theme.service)
-│   ├── spec.md / SPEC.MD   # Product & Architectural Specification (Sarah's Feedback Dashboard)
-│   └── package.json        # Dependencies (pnpm, Angular 22, Tailwind v4, Lucide Angular)
+│   ├── SPEC.MD             # Product & Architectural Specification (Sarah's Feedback Dashboard)
+│   └── package.json        # Dependencies (pnpm, Angular 22, Tailwind v4)
 │
 ├── idea-hub-api/           # RESTful Backend API (Go 1.24 + Fiber v2 + SQLite)
 │   ├── cmd/api/main.go     # Fiber server entrypoint with CORS (port :8080)
@@ -26,12 +25,11 @@ C:\Users\bigbu\source\repos\todoapp\
 │   ├── go.mod / go.sum     # Pinned stable Go dependencies (fiber/v2 v2.52.5, go-sqlite3, uuid)
 │   └── feedback.db         # Local SQLite database file (WAL journaled, git-ignored)
 │
-├── todoapp/                # Classic Todo Application (Angular 22 + Tailwind CSS v4)
-│   ├── src/app/            # Todo components, services, and models
-│   └── package.json        # Angular todo frontend app
-│
+├── README.md               # Complete project documentation & setup guide
 └── GEMINI.md               # Workspace guidelines (this file)
 ```
+
+> **Note on Workspace Location:** The workspace is currently located at `C:\Users\bigbu\source\repos\todoapp\`. Paths within tools should target `idea-hub` and `idea-hub-api` without relying on legacy todo application references. In future reorganization, the repository may be relocated to `C:\Users\bigbu\source\repos\idea-hub\`.
 
 ---
 
@@ -89,11 +87,11 @@ cr review --agent --gate major --base main
 
 ## 4. Technology Stack & Coding Standards
 
-### Frontend (`idea-hub` & `todoapp`):
+### Frontend (`idea-hub`):
 * **Framework:** Angular 22 (Standalone Components only; no NgModules).
 * **State Management:** Angular Signals (`signal()`, `computed()`, `effect()`).
 * **Styling:** Tailwind CSS v4 with PostCSS. Warm editorial paper palette (`#F8F7F4`), serif headings (`Playfair Display`), sans-serif UI (`Plus Jakarta Sans`), with full Dark Mode support (`class="dark"`).
-* **Icons:** Lucide Angular or inline SVG icons.
+* **Icons:** Inline SVG and Lucide Angular icons.
 * **Component Design:** Clean separation of concerns; inputs/outputs via `input()` and `output()` Signal APIs.
 
 ### Backend (`idea-hub-api`):
