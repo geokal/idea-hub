@@ -88,8 +88,24 @@ export class IdeaService {
   private readonly _ideaDetailSeq = new Map<string, number>();
   private _listRevision = 0;
 
-  // 1. Perspective / Role
+  // 1. Perspective / Role & Admin Key
   readonly currentRole = signal<UserRole>(this._loadRole());
+  readonly adminApiKey = signal<string>(
+    typeof window !== 'undefined'
+      ? (sessionStorage.getItem('ideahub_admin_key') || '')
+      : ''
+  );
+
+  setAdminApiKey(key: string): void {
+    this.adminApiKey.set(key);
+    try {
+      if (key) {
+        sessionStorage.setItem('ideahub_admin_key', key);
+      } else {
+        sessionStorage.removeItem('ideahub_admin_key');
+      }
+    } catch {}
+  }
 
   // 2. State Stores
   private readonly _ideas = signal<ProductIdea[]>(this._loadIdeas());
@@ -136,6 +152,7 @@ export class IdeaService {
     this._loadPendingSubmissions();
     // Initial fetch from Go API backend
     this.refreshIdeas();
+    this.fetchNotifications();
     this._replayPendingSubmissions();
 
     // Auto-fetch full detail when an idea is opened
@@ -154,8 +171,11 @@ export class IdeaService {
     });
     const role = this.currentRole();
     if (role === 'team' || role === 'admin') {
-      headers = headers.set('X-User-Role', role)
-                       .set('X-Admin-Key', 'ideahub-admin-dev-secret');
+      headers = headers.set('X-User-Role', role);
+      const key = this.adminApiKey();
+      if (key) {
+        headers = headers.set('X-Admin-Key', key);
+      }
     }
     return headers;
   }
@@ -173,16 +193,11 @@ export class IdeaService {
 
           const existingMap = new Map(this._ideas().map(i => [i.id, i]));
 
-          // Reconcile pending submissions with canonical backend IDs
+          // Reconcile pending submissions with canonical backend IDs only by exact ID match
           for (const dto of dtos) {
-            for (const [tempId, pending] of this._pendingSubmissions.entries()) {
-              if (dto.title === pending.title && dto.authorName === pending.authorName) {
-                this._pendingSubmissions.delete(tempId);
-                this._savePendingSubmissions();
-                if (this.selectedIdeaId() === tempId) {
-                  this.selectedIdeaId.set(dto.id);
-                }
-              }
+            if (this._pendingSubmissions.has(dto.id)) {
+              this._pendingSubmissions.delete(dto.id);
+              this._savePendingSubmissions();
             }
           }
 
@@ -201,9 +216,12 @@ export class IdeaService {
                 : (dto.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''),
               upvotes: dto.upvotes,
               upvotedByUser: prev ? prev.upvotedByUser : false,
-              subscribedUserEmails: prev?.subscribedUserEmails || [CURRENT_CUSTOMER_EMAIL],
+              subscribedUserEmails: prev?.subscribedUserEmails || [],
               createdAt: dto.createdAt,
-              comments: prev?.comments || [],
+              comments: (prev?.comments || []).map(c => ({
+                ...c,
+                authorEmail: isTeam ? (c.authorEmail || '') : (c.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : '')
+              })),
               commentsCount: dto.commentsCount,
               internalNotes: isTeam ? (prev?.internalNotes || []) : [],
               statusHistory: prev?.statusHistory || [],
@@ -253,13 +271,11 @@ export class IdeaService {
                 commentsCount: detail.comments?.length ?? detail.commentsCount,
                 mergedIntoId: detail.mergedIntoId,
                 mergedIntoTitle: detail.mergedIntoTitle,
-                subscribedUserEmails: (detail.subscribers && detail.subscribers.length > 0)
-                  ? Array.from(new Set([...detail.subscribers, ...(idea.subscribedUserEmails || [])]))
-                  : idea.subscribedUserEmails,
+                subscribedUserEmails: detail.subscribers || [],
                 comments: (detail.comments || []).map(c => ({
                   id: c.id,
                   authorName: c.authorName,
-                  authorEmail: isTeam ? (c.authorEmail || '') : '',
+                  authorEmail: isTeam ? (c.authorEmail || '') : (c.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''),
                   isTeamMember: c.isTeamMember,
                   content: c.content,
                   createdAt: c.createdAt
@@ -437,10 +453,11 @@ export class IdeaService {
     this._ideas.update(list => [newIdea, ...list]);
     this._saveIdeas();
 
-    // Call Go Fiber API backend
+    // Call Go Fiber API backend with client-generated id for idempotency
     this.http.post<{ id: string; message: string }>(
       `${this.API_BASE}/ideas`,
       {
+        id: tempId,
         title: newIdea.title,
         description: newIdea.description,
         category: newIdea.category,
@@ -452,19 +469,27 @@ export class IdeaService {
       next: (res) => {
         this._pendingSubmissions.delete(tempId);
         this._savePendingSubmissions();
-        if (res && res.id) {
-          // Remap selection if user opened the item while creation was in flight
-          if (this.selectedIdeaId() === tempId) {
-            this.selectedIdeaId.set(res.id);
-          }
+        const serverId = res?.id || tempId;
+        if (this.selectedIdeaId() === tempId) {
+          this.selectedIdeaId.set(serverId);
+        }
+        if (serverId !== tempId) {
           this._ideas.update(list =>
-            list.map(i => i.id === tempId ? { ...i, id: res.id } : i)
+            list.map(i => i.id === tempId ? { ...i, id: serverId } : i)
           );
           this._saveIdeas();
         }
       },
       error: (err) => {
-        console.warn('Submit idea API sync error, preserved in pending storage for replay:', err);
+        if (err && err.status === 400) {
+          // Validation error from server: discard invalid submission to avoid eternal retries
+          this._pendingSubmissions.delete(tempId);
+          this._savePendingSubmissions();
+          this._ideas.update(list => list.filter(i => i.id !== tempId));
+          this._saveIdeas();
+        } else {
+          console.warn('Submit idea API sync error, preserved in pending storage for replay:', err);
+        }
       }
     });
 
@@ -525,10 +550,12 @@ export class IdeaService {
   // Toggle Subscription
   toggleSubscription(ideaId: string): void {
     this._listRevision++;
+    let willBeSubscribed = false;
     this._ideas.update(list =>
       list.map(idea => {
         if (idea.id !== ideaId) return idea;
         const isSub = idea.subscribedUserEmails.includes(CURRENT_CUSTOMER_EMAIL);
+        willBeSubscribed = !isSub;
         const nextSubs = isSub
           ? idea.subscribedUserEmails.filter(e => e !== CURRENT_CUSTOMER_EMAIL)
           : [...idea.subscribedUserEmails, CURRENT_CUSTOMER_EMAIL];
@@ -544,9 +571,27 @@ export class IdeaService {
     // Persist subscription on the server so status updates notify across browsers
     this.http.post<{ subscribed: boolean }>(
       `${this.API_BASE}/ideas/${ideaId}/subscribe`,
-      { email: CURRENT_CUSTOMER_EMAIL },
+      { email: CURRENT_CUSTOMER_EMAIL, action: willBeSubscribed ? 'subscribe' : 'unsubscribe' },
       { headers: this._getHeaders() }
     ).subscribe({
+      next: (res) => {
+        if (res && typeof res.subscribed === 'boolean') {
+          this._ideas.update(list =>
+            list.map(i => {
+              if (i.id !== ideaId) return i;
+              const hasIt = i.subscribedUserEmails.includes(CURRENT_CUSTOMER_EMAIL);
+              let nextSubs = i.subscribedUserEmails;
+              if (res.subscribed && !hasIt) {
+                nextSubs = [...i.subscribedUserEmails, CURRENT_CUSTOMER_EMAIL];
+              } else if (!res.subscribed && hasIt) {
+                nextSubs = i.subscribedUserEmails.filter(e => e !== CURRENT_CUSTOMER_EMAIL);
+              }
+              return { ...i, subscribedUserEmails: nextSubs };
+            })
+          );
+          this._saveIdeas();
+        }
+      },
       error: (err) => console.warn('Subscription server sync error:', err)
     });
   }
@@ -998,9 +1043,66 @@ export class IdeaService {
     this._saveNotifications();
   }
 
+  fetchNotifications(): void {
+    const email = CURRENT_CUSTOMER_EMAIL;
+    this.http.get<Array<{
+      id: string;
+      ideaId: string;
+      eventType: string;
+      title: string;
+      message: string;
+      status: string;
+      createdAt: string;
+    }>>(`${this.API_BASE}/notifications?email=${encodeURIComponent(email)}`, {
+      headers: this._getHeaders()
+    }).subscribe({
+      next: (serverNotifs) => {
+        if (!serverNotifs) return;
+        const mapped: CustomerNotification[] = serverNotifs.map(n => ({
+          id: n.id,
+          ideaId: n.ideaId,
+          ideaTitle: n.title,
+          recipientEmail: email,
+          message: n.message,
+          status: (n.status as IdeaStatus) || 'under-review',
+          createdAt: n.createdAt,
+          read: false
+        }));
+
+        this._notifications.update(local => {
+          const localMap = new Map(local.map(l => [l.id, l]));
+          for (const s of mapped) {
+            if (!localMap.has(s.id)) {
+              localMap.set(s.id, s);
+            }
+          }
+          return Array.from(localMap.values()).sort(
+            (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+          );
+        });
+        this._saveNotifications();
+      },
+      error: (err) => {
+        console.warn('Could not fetch server notifications:', err);
+      }
+    });
+  }
+
   private _saveIdeas(): void {
     try {
-      localStorage.setItem(STORAGE_IDEAS_KEY, JSON.stringify(this._ideas()));
+      const isTeam = this.isTeamMember();
+      const payload = isTeam
+        ? this._ideas()
+        : this._ideas().map(i => ({
+            ...i,
+            authorEmail: i.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : '',
+            internalNotes: [],
+            comments: (i.comments || []).map(c => ({
+              ...c,
+              authorEmail: c.authorName === CURRENT_CUSTOMER_NAME ? CURRENT_CUSTOMER_EMAIL : ''
+            }))
+          }));
+      localStorage.setItem(STORAGE_IDEAS_KEY, JSON.stringify(payload));
     } catch {}
   }
 
@@ -1029,6 +1131,7 @@ export class IdeaService {
       this.http.post<{ id: string; message: string }>(
         `${this.API_BASE}/ideas`,
         {
+          id: item.tempId,
           title: item.title,
           description: item.description,
           category: item.category,
@@ -1040,17 +1143,24 @@ export class IdeaService {
         next: (res) => {
           this._pendingSubmissions.delete(tempId);
           this._savePendingSubmissions();
-          if (res && res.id) {
-            if (this.selectedIdeaId() === tempId) {
-              this.selectedIdeaId.set(res.id);
-            }
+          const serverId = res?.id || tempId;
+          if (this.selectedIdeaId() === tempId) {
+            this.selectedIdeaId.set(serverId);
+          }
+          if (serverId !== tempId) {
             this._ideas.update(list =>
-              list.map(i => i.id === tempId ? { ...i, id: res.id } : i)
+              list.map(i => i.id === tempId ? { ...i, id: serverId } : i)
             );
             this._saveIdeas();
           }
         },
-        error: (err) => console.warn('Pending replay error for', tempId, err)
+        error: (err) => {
+          if (err && err.status === 400) {
+            this._pendingSubmissions.delete(tempId);
+            this._savePendingSubmissions();
+          }
+          console.warn('Pending replay error for', tempId, err);
+        }
       });
     }
   }

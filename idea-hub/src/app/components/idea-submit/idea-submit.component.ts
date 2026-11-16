@@ -189,7 +189,7 @@ import { IdeaCategory, ProductIdea } from '../../models/idea.model';
   `,
 })
 export class IdeaSubmitComponent {
-  private static readonly EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  private static readonly EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
 
   readonly ideaService = inject(IdeaService);
   readonly submitDialog = viewChild<ElementRef<HTMLElement>>('submitDialog');
