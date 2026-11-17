@@ -132,9 +132,19 @@ func TestMergeNotification_NotPersistedOnRollback(t *testing.T) {
 	idA := uuid.New().String()
 	idB := uuid.New().String()
 	authorA := "alice@example.com"
+	authorB := "bob@example.com"
 
 	createTestIdea(t, db, idA, "Idea A", "Desc A", authorA)
-	// Notice: idB does not exist in DB! Merge should fail and rollback
+	createTestIdea(t, db, idB, "Idea B", "Desc B", authorB)
+
+	// Install a trigger that aborts notification insertion, forcing a transactional rollback after writes
+	_, err := db.DB.Exec("CREATE TRIGGER fail_notif BEFORE INSERT ON notifications BEGIN SELECT RAISE(ABORT, 'forced notification failure'); END;")
+	if err != nil {
+		t.Fatalf("Failed to create test trigger: %v", err)
+	}
+	defer func() {
+		_, _ = db.DB.Exec("DROP TRIGGER IF EXISTS fail_notif")
+	}()
 
 	mergePayload, _ := json.Marshal(map[string]string{
 		"sourceIdeaId": idA,
@@ -150,8 +160,29 @@ func TestMergeNotification_NotPersistedOnRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Merge request failed: %v", err)
 	}
-	if resp.StatusCode != 404 {
-		t.Fatalf("Expected 404 on invalid target, got %d", resp.StatusCode)
+	if resp.StatusCode != 500 {
+		t.Fatalf("Expected 500 on transaction failure, got %d", resp.StatusCode)
+	}
+
+	// Verify database rollback: Idea A must still be 'under-review' with NULL merged_into_id
+	var statusA string
+	var mergedIntoA *string
+	err = db.DB.QueryRow("SELECT status, merged_into_id FROM ideas WHERE id = ?", idA).Scan(&statusA, &mergedIntoA)
+	if err != nil {
+		t.Fatalf("Failed to query idea A: %v", err)
+	}
+	if statusA != "under-review" {
+		t.Fatalf("Expected idea A status 'under-review' after rollback, got %s", statusA)
+	}
+	if mergedIntoA != nil {
+		t.Fatalf("Expected idea A merged_into_id to be NULL after rollback, got %v", *mergedIntoA)
+	}
+
+	// Verify database rollback: Idea B upvotes must not have incremented
+	var upvotesB int
+	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB)
+	if upvotesB != 1 {
+		t.Fatalf("Expected idea B upvotes to remain 1 after rollback, got %d", upvotesB)
 	}
 
 	// Ensure NO notifications were inserted
@@ -159,6 +190,13 @@ func TestMergeNotification_NotPersistedOnRollback(t *testing.T) {
 	_ = db.DB.QueryRow("SELECT COUNT(*) FROM notifications").Scan(&count)
 	if count != 0 {
 		t.Fatalf("Expected 0 notifications after rollback, got %d", count)
+	}
+
+	// Ensure NO status_changes were recorded
+	var changeCount int
+	_ = db.DB.QueryRow("SELECT COUNT(*) FROM status_changes WHERE idea_id = ? AND to_status = 'merged'", idA).Scan(&changeCount)
+	if changeCount != 0 {
+		t.Fatalf("Expected 0 status changes for idea A after rollback, got %d", changeCount)
 	}
 }
 
@@ -281,6 +319,197 @@ func TestChainedMerge_Resubscription(t *testing.T) {
 	subs, ok := detailBody["subscribers"].([]interface{})
 	if !ok || len(subs) != 1 {
 		t.Fatalf("Expected 1 subscriber in detail for C, got %v", detailBody["subscribers"])
+	}
+}
+
+func TestMergedDiscussion_ReplyNotificationDelivery(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.DB.Close()
+
+	idA := uuid.New().String()
+	idB := uuid.New().String()
+	authorA := "alice@example.com"
+	authorB := "bob@example.com"
+	reader := "reader@example.com"
+
+	createTestIdea(t, db, idA, "Idea A", "Desc A", authorA)
+	createTestIdea(t, db, idB, "Idea B", "Desc B", authorB)
+
+	// 1. Reader subscribes to Idea A
+	subPayload, _ := json.Marshal(map[string]string{
+		"email":  reader,
+		"action": "subscribe",
+	})
+	subReq := httptest.NewRequest("POST", "/api/ideas/"+idA+"/subscribe", bytes.NewReader(subPayload))
+	subReq.Header.Set("Content-Type", "application/json")
+	subReq.Header.Set("X-Voter-Key", reader)
+	subResp, _ := app.Test(subReq)
+	if subResp.StatusCode != 200 {
+		t.Fatalf("Failed to subscribe reader: %d", subResp.StatusCode)
+	}
+
+	// 2. Merge Idea A into Idea B
+	mergePayload, _ := json.Marshal(map[string]string{
+		"sourceIdeaId": idA,
+		"targetIdeaId": idB,
+	})
+	mergeReq := httptest.NewRequest("POST", "/api/ideas/merge", bytes.NewReader(mergePayload))
+	mergeReq.Header.Set("Content-Type", "application/json")
+	mergeReq.Header.Set("X-Admin-Key", "test-admin-secret-key")
+	mergeReq.Header.Set("X-User-Role", "admin")
+	mergeResp, _ := app.Test(mergeReq)
+	if mergeResp.StatusCode != 200 {
+		t.Fatalf("Failed to merge A into B: %d", mergeResp.StatusCode)
+	}
+
+	// 3. Product team posts a public comment on merged Idea A
+	commentPayload, _ := json.Marshal(map[string]interface{}{
+		"authorName": "Product Team",
+		"content":    "We have addressed this in the latest update!",
+		"isInternal": false,
+	})
+	commentReq := httptest.NewRequest("POST", "/api/ideas/"+idA+"/comments", bytes.NewReader(commentPayload))
+	commentReq.Header.Set("Content-Type", "application/json")
+	commentReq.Header.Set("X-Admin-Key", "test-admin-secret-key")
+	commentReq.Header.Set("X-User-Role", "team")
+	commentResp, _ := app.Test(commentReq)
+	if commentResp.StatusCode != 201 {
+		t.Fatalf("Failed to post team comment on merged idea: %d", commentResp.StatusCode)
+	}
+
+	// 4. Verify reader receives a reply notification linking to Idea A
+	notifReq := httptest.NewRequest("GET", "/api/notifications?email="+reader, nil)
+	notifReq.Header.Set("X-Voter-Key", reader)
+	notifResp, err := app.Test(notifReq)
+	if err != nil || notifResp.StatusCode != 200 {
+		t.Fatalf("Failed to get notifications for reader: %v", err)
+	}
+
+	var readerNotifs []map[string]interface{}
+	_ = json.NewDecoder(notifResp.Body).Decode(&readerNotifs)
+	var readerTeamReply map[string]interface{}
+	for _, n := range readerNotifs {
+		if n["eventType"] == "team_reply" {
+			readerTeamReply = n
+			break
+		}
+	}
+	if readerTeamReply == nil {
+		t.Fatalf("Expected reader to receive team_reply notification, got %v", readerNotifs)
+	}
+	if readerTeamReply["ideaId"] != idA {
+		t.Fatalf("Expected notification ideaId to link to discussion idea %s, got %v", idA, readerTeamReply["ideaId"])
+	}
+
+	// 5. Verify author Alice also receives the reply notification
+	aliceReq := httptest.NewRequest("GET", "/api/notifications?email="+authorA, nil)
+	aliceReq.Header.Set("X-Voter-Key", authorA)
+	aliceResp, err := app.Test(aliceReq)
+	if err != nil || aliceResp.StatusCode != 200 {
+		t.Fatalf("Failed to get notifications for author: %v", err)
+	}
+	var aliceNotifs []map[string]interface{}
+	_ = json.NewDecoder(aliceResp.Body).Decode(&aliceNotifs)
+	foundAliceReply := false
+	for _, n := range aliceNotifs {
+		if n["eventType"] == "team_reply" && n["ideaId"] == idA {
+			foundAliceReply = true
+			break
+		}
+	}
+	if !foundAliceReply {
+		t.Fatalf("Expected author Alice to receive team_reply notification for idea %s", idA)
+	}
+}
+
+func TestMerge_Reopen_Remerge_NoDoubleCounting(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.DB.Close()
+
+	idA := uuid.New().String()
+	idB := uuid.New().String()
+	authorA := "alice@example.com"
+	authorB := "bob@example.com"
+
+	createTestIdea(t, db, idA, "Idea A", "Desc A", authorA)
+	createTestIdea(t, db, idB, "Idea B", "Desc B", authorB)
+
+	// Record initial author vote rows in votes table
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, _ = db.DB.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", uuid.New().String(), idA, authorA, now)
+	_, _ = db.DB.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", uuid.New().String(), idB, authorB, now)
+
+	// 1. Merge A into B
+	mergePayload, _ := json.Marshal(map[string]string{
+		"sourceIdeaId": idA,
+		"targetIdeaId": idB,
+	})
+	req1 := httptest.NewRequest("POST", "/api/ideas/merge", bytes.NewReader(mergePayload))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-Admin-Key", "test-admin-secret-key")
+	req1.Header.Set("X-User-Role", "admin")
+	resp1, _ := app.Test(req1)
+	if resp1.StatusCode != 200 {
+		t.Fatalf("Failed first merge: %d", resp1.StatusCode)
+	}
+
+	var upvotesB1 int
+	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB1)
+	if upvotesB1 != 2 {
+		t.Fatalf("Expected idea B upvotes to be 2 after merge, got %d", upvotesB1)
+	}
+
+	// 2. Reopen Idea A to under-review
+	statusPayload, _ := json.Marshal(map[string]string{
+		"status": "under-review",
+		"note":   "Reopening feedback item",
+	})
+	statusReq := httptest.NewRequest("POST", "/api/ideas/"+idA+"/status", bytes.NewReader(statusPayload))
+	statusReq.Header.Set("Content-Type", "application/json")
+	statusReq.Header.Set("X-Admin-Key", "test-admin-secret-key")
+	statusReq.Header.Set("X-User-Role", "admin")
+	statusResp, _ := app.Test(statusReq)
+	if statusResp.StatusCode != 200 {
+		t.Fatalf("Failed to update status to under-review: %d", statusResp.StatusCode)
+	}
+
+	// Verify Target B upvotes was reconciled back to 1
+	var upvotesB2 int
+	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB2)
+	if upvotesB2 != 1 {
+		t.Fatalf("Expected idea B upvotes to decrement back to 1 on reopen, got %d", upvotesB2)
+	}
+
+	// Verify Idea A is under-review and unlinked
+	var statusA string
+	var mergedIntoA *string
+	var upvotesA int
+	_ = db.DB.QueryRow("SELECT status, merged_into_id, upvotes FROM ideas WHERE id = ?", idA).Scan(&statusA, &mergedIntoA, &upvotesA)
+	if statusA != "under-review" {
+		t.Fatalf("Expected idea A status 'under-review', got %s", statusA)
+	}
+	if mergedIntoA != nil {
+		t.Fatalf("Expected idea A merged_into_id to be NULL, got %v", *mergedIntoA)
+	}
+	if upvotesA != 1 {
+		t.Fatalf("Expected idea A upvotes to be 1, got %d", upvotesA)
+	}
+
+	// 3. Re-merge Idea A into Idea B
+	req2 := httptest.NewRequest("POST", "/api/ideas/merge", bytes.NewReader(mergePayload))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Admin-Key", "test-admin-secret-key")
+	req2.Header.Set("X-User-Role", "admin")
+	resp2, _ := app.Test(req2)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("Failed second merge: %d", resp2.StatusCode)
+	}
+
+	// Verify Target B upvotes is 2, NOT 3 (no double counting!)
+	var upvotesB3 int
+	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB3)
+	if upvotesB3 != 2 {
+		t.Fatalf("Expected idea B upvotes to be 2 after re-merge (no double counting), got %d", upvotesB3)
 	}
 }
 

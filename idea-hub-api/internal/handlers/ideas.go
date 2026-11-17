@@ -631,7 +631,10 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 	defer tx.Rollback()
 
 	var prevStatus string
-	err = tx.QueryRow("SELECT status FROM ideas WHERE id = ?", id).Scan(&prevStatus)
+	var prevMergedIntoID sql.NullString
+	var sourceUpvotes int
+	var authorEmail, ideaTitle string
+	err = tx.QueryRow("SELECT status, merged_into_id, upvotes, author_email, title FROM ideas WHERE id = ?", id).Scan(&prevStatus, &prevMergedIntoID, &sourceUpvotes, &authorEmail, &ideaTitle)
 	if err == sql.ErrNoRows {
 		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
 	} else if err != nil {
@@ -648,9 +651,45 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 		}
 	}
 
-	_, err = tx.Exec("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", req.Status, now, id)
-	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	if prevStatus == "merged" && req.Status != "merged" {
+		// Reopening a previously merged idea: reconcile upvotes, votes, and subscriptions
+		if prevMergedIntoID.Valid && prevMergedIntoID.String != "" {
+			// Deduct previously consolidated upvotes from the target idea
+			_, err = tx.Exec(`
+				UPDATE ideas
+				SET upvotes = CASE WHEN upvotes >= ? THEN upvotes - ? ELSE 0 END, updated_at = ?
+				WHERE id = ?
+			`, sourceUpvotes, sourceUpvotes, now, prevMergedIntoID.String)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to reconcile target idea upvotes: " + err.Error()})
+			}
+
+			// Reconcile author vote: remove transferred vote from previous target
+			if cleanAuthor := strings.ToLower(strings.TrimSpace(authorEmail)); cleanAuthor != "" {
+				_, _ = tx.Exec("DELETE FROM votes WHERE idea_id = ? AND voter_key = ?", prevMergedIntoID.String, cleanAuthor)
+			}
+		}
+
+		// Clear merge target links on the reopened idea
+		_, err = tx.Exec("UPDATE ideas SET status = ?, merged_into_id = NULL, merged_into_title = NULL, updated_at = ? WHERE id = ?", req.Status, now, id)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		// Restore author vote on the reopened idea so it can be managed and tracked independently
+		if cleanAuthor := strings.ToLower(strings.TrimSpace(authorEmail)); cleanAuthor != "" {
+			voteID := uuid.New().String()
+			_, _ = tx.Exec("INSERT OR IGNORE INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", voteID, id, cleanAuthor, now)
+
+			// Restore author subscription on the reopened idea
+			subID := uuid.New().String()
+			_, _ = tx.Exec("INSERT OR IGNORE INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, id, cleanAuthor, now)
+		}
+	} else {
+		_, err = tx.Exec("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", req.Status, now, id)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
 	}
 
 	changeID := uuid.New().String()
@@ -663,9 +702,6 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 	}
 
 	// Persist server-side notification events for author and subscribers
-	var authorEmail, ideaTitle string
-	_ = tx.QueryRow("SELECT author_email, title FROM ideas WHERE id = ?", id).Scan(&authorEmail, &ideaTitle)
-
 	recipients := make(map[string]bool)
 	if authorEmail != "" {
 		recipients[strings.ToLower(strings.TrimSpace(authorEmail))] = true
@@ -786,7 +822,20 @@ func (h *Handler) CreateComment(c *fiber.Ctx) error {
 		if ideaAuthorEmail != "" {
 			recipients[strings.ToLower(strings.TrimSpace(ideaAuthorEmail))] = true
 		}
-		subRows, err := h.db.DB.Query("SELECT user_email FROM subscriptions WHERE idea_id = ?", id)
+
+		canonicalID, familyIDs := h.getMergeFamilyIDs(id)
+		subQuery := "SELECT user_email FROM subscriptions WHERE idea_id = ?"
+		args := []interface{}{canonicalID}
+		if len(familyIDs) > 1 {
+			placeholders := make([]string, len(familyIDs))
+			args = make([]interface{}, len(familyIDs))
+			for i, fid := range familyIDs {
+				placeholders[i] = "?"
+				args[i] = fid
+			}
+			subQuery = fmt.Sprintf("SELECT user_email FROM subscriptions WHERE idea_id IN (%s)", strings.Join(placeholders, ","))
+		}
+		subRows, err := h.db.DB.Query(subQuery, args...)
 		if err == nil {
 			for subRows.Next() {
 				var subEmail string
@@ -912,6 +961,10 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 			}
 		}
 		vRows.Close()
+	}
+
+	if len(sourceVoters) == 0 && sourceAuthorEmail != "" {
+		sourceVoters = append(sourceVoters, strings.ToLower(strings.TrimSpace(sourceAuthorEmail)))
 	}
 
 	newTransferredVotes := 0
