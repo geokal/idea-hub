@@ -631,14 +631,18 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 	defer tx.Rollback()
 
 	var prevStatus string
-	var prevMergedIntoID sql.NullString
-	var sourceUpvotes int
 	var authorEmail, ideaTitle string
-	err = tx.QueryRow("SELECT status, merged_into_id, upvotes, author_email, title FROM ideas WHERE id = ?", id).Scan(&prevStatus, &prevMergedIntoID, &sourceUpvotes, &authorEmail, &ideaTitle)
+	err = tx.QueryRow("SELECT status, author_email, title FROM ideas WHERE id = ?", id).Scan(&prevStatus, &authorEmail, &ideaTitle)
 	if err == sql.ErrNoRows {
 		return c.Status(404).JSON(fiber.Map{"error": "Idea not found"})
 	} else if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if prevStatus == "merged" {
+		return c.Status(400).JSON(fiber.Map{
+			"error": "Cannot change status of a merged feedback item. Merged duplicates are permanently consolidated into their canonical target.",
+		})
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -651,45 +655,9 @@ func (h *Handler) UpdateStatus(c *fiber.Ctx) error {
 		}
 	}
 
-	if prevStatus == "merged" && req.Status != "merged" {
-		// Reopening a previously merged idea: reconcile upvotes, votes, and subscriptions
-		if prevMergedIntoID.Valid && prevMergedIntoID.String != "" {
-			// Deduct previously consolidated upvotes from the target idea
-			_, err = tx.Exec(`
-				UPDATE ideas
-				SET upvotes = CASE WHEN upvotes >= ? THEN upvotes - ? ELSE 0 END, updated_at = ?
-				WHERE id = ?
-			`, sourceUpvotes, sourceUpvotes, now, prevMergedIntoID.String)
-			if err != nil {
-				return c.Status(500).JSON(fiber.Map{"error": "Failed to reconcile target idea upvotes: " + err.Error()})
-			}
-
-			// Reconcile author vote: remove transferred vote from previous target
-			if cleanAuthor := strings.ToLower(strings.TrimSpace(authorEmail)); cleanAuthor != "" {
-				_, _ = tx.Exec("DELETE FROM votes WHERE idea_id = ? AND voter_key = ?", prevMergedIntoID.String, cleanAuthor)
-			}
-		}
-
-		// Clear merge target links on the reopened idea
-		_, err = tx.Exec("UPDATE ideas SET status = ?, merged_into_id = NULL, merged_into_title = NULL, updated_at = ? WHERE id = ?", req.Status, now, id)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		// Restore author vote on the reopened idea so it can be managed and tracked independently
-		if cleanAuthor := strings.ToLower(strings.TrimSpace(authorEmail)); cleanAuthor != "" {
-			voteID := uuid.New().String()
-			_, _ = tx.Exec("INSERT OR IGNORE INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", voteID, id, cleanAuthor, now)
-
-			// Restore author subscription on the reopened idea
-			subID := uuid.New().String()
-			_, _ = tx.Exec("INSERT OR IGNORE INTO subscriptions (id, idea_id, user_email, created_at) VALUES (?, ?, ?, ?)", subID, id, cleanAuthor, now)
-		}
-	} else {
-		_, err = tx.Exec("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", req.Status, now, id)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
+	_, err = tx.Exec("UPDATE ideas SET status = ?, updated_at = ? WHERE id = ?", req.Status, now, id)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	changeID := uuid.New().String()
@@ -963,7 +931,7 @@ func (h *Handler) MergeIdeas(c *fiber.Ctx) error {
 		vRows.Close()
 	}
 
-	if len(sourceVoters) == 0 && sourceAuthorEmail != "" {
+	if len(sourceVoters) == 0 && sourceUpvotes > 0 && sourceAuthorEmail != "" {
 		sourceVoters = append(sourceVoters, strings.ToLower(strings.TrimSpace(sourceAuthorEmail)))
 	}
 

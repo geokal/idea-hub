@@ -422,7 +422,7 @@ func TestMergedDiscussion_ReplyNotificationDelivery(t *testing.T) {
 	}
 }
 
-func TestMerge_Reopen_Remerge_NoDoubleCounting(t *testing.T) {
+func TestMerge_StatusTransitionRejected(t *testing.T) {
 	app, db := setupTestApp(t)
 	defer db.DB.Close()
 
@@ -450,7 +450,7 @@ func TestMerge_Reopen_Remerge_NoDoubleCounting(t *testing.T) {
 	req1.Header.Set("X-User-Role", "admin")
 	resp1, _ := app.Test(req1)
 	if resp1.StatusCode != 200 {
-		t.Fatalf("Failed first merge: %d", resp1.StatusCode)
+		t.Fatalf("Failed merge: %d", resp1.StatusCode)
 	}
 
 	var upvotesB1 int
@@ -459,57 +459,91 @@ func TestMerge_Reopen_Remerge_NoDoubleCounting(t *testing.T) {
 		t.Fatalf("Expected idea B upvotes to be 2 after merge, got %d", upvotesB1)
 	}
 
-	// 2. Reopen Idea A to under-review
+	// 2. Attempt to reopen Idea A out of 'merged' status via UpdateStatus
 	statusPayload, _ := json.Marshal(map[string]string{
 		"status": "under-review",
-		"note":   "Reopening feedback item",
+		"note":   "Attempting to reopen feedback item",
 	})
 	statusReq := httptest.NewRequest("POST", "/api/ideas/"+idA+"/status", bytes.NewReader(statusPayload))
 	statusReq.Header.Set("Content-Type", "application/json")
 	statusReq.Header.Set("X-Admin-Key", "test-admin-secret-key")
 	statusReq.Header.Set("X-User-Role", "admin")
 	statusResp, _ := app.Test(statusReq)
-	if statusResp.StatusCode != 200 {
-		t.Fatalf("Failed to update status to under-review: %d", statusResp.StatusCode)
+	if statusResp.StatusCode != 400 {
+		t.Fatalf("Expected 400 Bad Request when attempting to reopen merged idea, got %d", statusResp.StatusCode)
 	}
 
-	// Verify Target B upvotes was reconciled back to 1
+	// Verify Target B upvotes remains 2 (not erased or corrupted)
 	var upvotesB2 int
 	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB2)
-	if upvotesB2 != 1 {
-		t.Fatalf("Expected idea B upvotes to decrement back to 1 on reopen, got %d", upvotesB2)
+	if upvotesB2 != 2 {
+		t.Fatalf("Expected idea B upvotes to remain 2, got %d", upvotesB2)
 	}
 
-	// Verify Idea A is under-review and unlinked
+	// Verify Idea A remains 'merged' and linked to B
 	var statusA string
 	var mergedIntoA *string
-	var upvotesA int
-	_ = db.DB.QueryRow("SELECT status, merged_into_id, upvotes FROM ideas WHERE id = ?", idA).Scan(&statusA, &mergedIntoA, &upvotesA)
-	if statusA != "under-review" {
-		t.Fatalf("Expected idea A status 'under-review', got %s", statusA)
+	_ = db.DB.QueryRow("SELECT status, merged_into_id FROM ideas WHERE id = ?", idA).Scan(&statusA, &mergedIntoA)
+	if statusA != "merged" {
+		t.Fatalf("Expected idea A status to remain 'merged', got %s", statusA)
 	}
-	if mergedIntoA != nil {
-		t.Fatalf("Expected idea A merged_into_id to be NULL, got %v", *mergedIntoA)
+	if mergedIntoA == nil || *mergedIntoA != idB {
+		t.Fatalf("Expected idea A to remain merged into %s, got %v", idB, mergedIntoA)
 	}
-	if upvotesA != 1 {
-		t.Fatalf("Expected idea A upvotes to be 1, got %d", upvotesA)
+}
+
+func TestMerge_ZeroVoteIdea_DoesNotInventVote(t *testing.T) {
+	app, db := setupTestApp(t)
+	defer db.DB.Close()
+
+	idA := uuid.New().String()
+	idB := uuid.New().String()
+	authorA := "alice@example.com"
+	authorB := "bob@example.com"
+
+	createTestIdea(t, db, idA, "Idea A", "Desc A", authorA)
+	createTestIdea(t, db, idB, "Idea B", "Desc B", authorB)
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, _ = db.DB.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", uuid.New().String(), idA, authorA, now)
+	_, _ = db.DB.Exec("INSERT INTO votes (id, idea_id, voter_key, created_at) VALUES (?, ?, ?, ?)", uuid.New().String(), idB, authorB, now)
+
+	// Alice removes her initial upvote on Idea A
+	_, err := db.DB.Exec("DELETE FROM votes WHERE idea_id = ? AND voter_key = ?", idA, authorA)
+	if err != nil {
+		t.Fatalf("Failed to remove vote: %v", err)
+	}
+	_, err = db.DB.Exec("UPDATE ideas SET upvotes = 0 WHERE id = ?", idA)
+	if err != nil {
+		t.Fatalf("Failed to set upvotes 0: %v", err)
 	}
 
-	// 3. Re-merge Idea A into Idea B
-	req2 := httptest.NewRequest("POST", "/api/ideas/merge", bytes.NewReader(mergePayload))
-	req2.Header.Set("Content-Type", "application/json")
-	req2.Header.Set("X-Admin-Key", "test-admin-secret-key")
-	req2.Header.Set("X-User-Role", "admin")
-	resp2, _ := app.Test(req2)
-	if resp2.StatusCode != 200 {
-		t.Fatalf("Failed second merge: %d", resp2.StatusCode)
+	// Merge Idea A (0 votes) into Idea B (1 vote)
+	mergePayload, _ := json.Marshal(map[string]string{
+		"sourceIdeaId": idA,
+		"targetIdeaId": idB,
+	})
+	req := httptest.NewRequest("POST", "/api/ideas/merge", bytes.NewReader(mergePayload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", "test-admin-secret-key")
+	req.Header.Set("X-User-Role", "admin")
+	resp, _ := app.Test(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("Failed to merge zero-vote idea: %d", resp.StatusCode)
 	}
 
-	// Verify Target B upvotes is 2, NOT 3 (no double counting!)
-	var upvotesB3 int
-	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB3)
-	if upvotesB3 != 2 {
-		t.Fatalf("Expected idea B upvotes to be 2 after re-merge (no double counting), got %d", upvotesB3)
+	// Verify Target B upvotes remains 1 (no invented votes)
+	var upvotesB int
+	_ = db.DB.QueryRow("SELECT upvotes FROM ideas WHERE id = ?", idB).Scan(&upvotesB)
+	if upvotesB != 1 {
+		t.Fatalf("Expected target idea B upvotes to remain 1, got %d", upvotesB)
+	}
+
+	// Verify Target B has no vote row from authorA
+	var authorAVotes int
+	_ = db.DB.QueryRow("SELECT COUNT(*) FROM votes WHERE idea_id = ? AND voter_key = ?", idB, authorA).Scan(&authorAVotes)
+	if authorAVotes != 0 {
+		t.Fatalf("Expected 0 votes from authorA on target B, got %d", authorAVotes)
 	}
 }
 
